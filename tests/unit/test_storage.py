@@ -42,12 +42,18 @@ def _rows(path: Path, table: str, order: str = "1") -> list[tuple]:
         connection.close()
 
 
-def test_default_runtime_root_is_not_a_temp_directory(monkeypatch):
-    monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\tester\AppData\Local")
-    monkeypatch.setattr(storage.os, "name", "nt")
-    root = storage.default_runtime_root()
-    assert root == Path(r"C:\Users\tester\AppData\Local") / "EpitopeRank"
-    assert "Temp" not in str(root)
+def test_default_runtime_root_is_not_a_temp_directory(monkeypatch, tmp_path):
+    if storage.os.name == "nt":
+        monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\tester\AppData\Local")
+        root = storage.default_runtime_root()
+        assert root == Path(r"C:\Users\tester\AppData\Local") / "EpitopeRank"
+        assert "Temp" not in str(root)
+    else:
+        xdg = tmp_path / "xdg_data"
+        monkeypatch.setenv("XDG_DATA_HOME", str(xdg))
+        root = storage.default_runtime_root()
+        assert root == xdg / "epitoperank"
+        assert "/var/tmp" not in str(root)
 
 
 def test_merge_keeps_artifacts_from_both_databases(tmp_path):
