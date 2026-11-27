@@ -28,9 +28,12 @@ def digest(value: Any) -> str:
 
 # 中文备注：大模型层：计算哈希文件（参数：path）
 def file_hash(path: Path) -> str:
-    # Same streaming SHA-256 algorithm used by input manifests.
+    # Same streaming SHA-256 algorithm used by input manifests (Python 3.10 compatible).
+    hasher = hashlib.sha256()
     with path.open("rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest()
+        for chunk in iter(lambda: handle.read(65536), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 
 # 中文备注：大模型层：辅助处理输入指纹（参数：path）

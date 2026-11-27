@@ -1854,8 +1854,11 @@ def _groups_from_identical_upload(directory: Path, sample_ids: Sequence[str]) ->
 
     def digest(path: Path) -> str:
         """计算文件的 SHA-256 摘要，用于判断两个上传目录中的事件表是否完全一致。"""
+        hasher = hashlib.sha256()
         with path.open("rb") as handle:
-            return hashlib.file_digest(handle, "sha256").hexdigest()
+            for chunk in iter(lambda: handle.read(65536), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
 
     source_digest = None
     assignments: list[dict[str, str]] = []
