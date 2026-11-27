@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/logo.png" alt="EpitopeRank-ESM2 Logo" width="128" height="128" />
+</p>
+
 # EpitopeRank-ESM2
 
 [简体中文](README.md) · [繁體中文](README.zh-TW.md) · **English**

@@ -38,37 +38,35 @@ logger = logging.getLogger(__name__)
 #: Remembered CDS column mappings, stored next to the table it describes.
 CDS_MAPPING_FILE = ".cds_mapping.json"
 
-# Dark ocean tile with the teal helix + purple AI node, matching the app icon.
+# Midnight-navy squircle with cyan splice exons + arc, violet HLA-I binding groove,
+# and golden-amber TCR immunogenicity diamond hotspot, matching packaging/icon.ico.
 # Served as a real endpoint because browsers probe /favicon.ico unconditionally
 # and a 404 there shows up as a console error.
 _FAVICON_SVG = (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
-    '<defs>'
-    '<linearGradient id="p" x1="0" y1="0" x2="1" y2="1">'
-    '<stop offset="0" stop-color="#0e3240"/><stop offset="1" stop-color="#04101a"/>'
+    "<defs>"
+    '<linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">'
+    '<stop offset="0" stop-color="#1b2b4e"/><stop offset="1" stop-color="#070e20"/>'
     "</linearGradient>"
-    '<linearGradient id="s" x1="0" y1="0" x2="0" y2="1">'
-    '<stop offset="0" stop-color="#c8fff6"/><stop offset="1" stop-color="#2dd4bf"/>'
+    '<linearGradient id="ex" x1="0" y1="0" x2="0" y2="1">'
+    '<stop offset="0" stop-color="#5eead4"/><stop offset="1" stop-color="#06b6d4"/>'
+    "</linearGradient>"
+    '<linearGradient id="hla" x1="0" y1="0" x2="0" y2="1">'
+    '<stop offset="0" stop-color="#a5b4fc"/><stop offset="1" stop-color="#4f46e5"/>'
+    "</linearGradient>"
+    '<linearGradient id="gem" x1="0" y1="0" x2="1" y2="1">'
+    '<stop offset="0" stop-color="#fef08a"/><stop offset="1" stop-color="#f59e0b"/>'
     "</linearGradient>"
     "</defs>"
-    '<rect width="32" height="32" rx="7" fill="url(#p)"/>'
-    '<path d="M10.50 5.25L10.61 5.70L10.94 6.15L11.47 6.59L12.18 7.04L13.05 7.49L14.04 7.94'
-    "L15.10 8.39L16.21 8.83L17.30 9.28L18.34 9.73L19.29 10.18L20.10 10.62L20.75 11.07L21.21 11.52"
-    "L21.46 11.97L21.48 12.42L21.29 12.86L20.89 13.31L20.28 13.76L19.51 14.21L18.59 14.66L17.57 15.10"
-    "L16.49 15.55L15.38 16.00L14.31 16.45L13.29 16.90L12.39 17.34L11.64 17.79L11.06 18.24L10.67 18.69"
-    "L10.51 19.14L10.56 19.58L10.83 20.03L11.32 20.48L11.99 20.93L12.82 21.38L13.78 21.82L14.83 22.27"
-    "L15.92 22.72L17.02 23.17L18.08 23.61L19.06 24.06L19.91 24.51L20.60 24.96L21.11 25.41L21.41 25.85"
-    'L21.50 26.30L21.36 26.75" fill="none" stroke="#11837d" stroke-width="2.6" stroke-linecap="round"/>'
-    '<path d="M21.50 5.25L21.39 5.70L21.06 6.15L20.53 6.59L19.82 7.04L18.95 7.49L17.96 7.94'
-    "L16.90 8.39L15.79 8.83L14.70 9.28L13.66 9.73L12.71 10.18L11.90 10.62L11.25 11.07L10.79 11.52"
-    "L10.54 11.97L10.52 12.42L10.71 12.86L11.11 13.31L11.72 13.76L12.49 14.21L13.41 14.66L14.43 15.10"
-    "L15.51 15.55L16.62 16.00L17.69 16.45L18.71 16.90L19.61 17.34L20.36 17.79L20.94 18.24L21.33 18.69"
-    "L21.49 19.14L21.44 19.58L21.17 20.03L20.68 20.48L20.01 20.93L19.18 21.38L18.22 21.82L17.17 22.27"
-    "L16.08 22.72L14.98 23.17L13.92 23.61L12.94 24.06L12.09 24.51L11.40 24.96L10.89 25.41L10.59 25.85"
-    'L10.50 26.30L10.64 26.75" fill="none" stroke="url(#s)" stroke-width="2.6" stroke-linecap="round"/>'
-    '<circle cx="16" cy="15.75" r="2.6" fill="none" stroke="#c4b5fd" stroke-opacity=".7" stroke-width=".8"/>'
-    '<circle cx="16" cy="15.75" r="1.7" fill="#a855f7"/>'
-    '<circle cx="15.5" cy="15.25" r=".55" fill="#fff"/>'
+    '<rect width="32" height="32" rx="7.5" fill="url(#bg)"/>'
+    '<rect x="1.2" y="1.2" width="29.6" height="29.6" rx="6.5" fill="none" stroke="#93c5fd" stroke-opacity=".3" stroke-width="1"/>'
+    '<path d="M10.5 16.5 C10.5 23.2, 21.5 23.2, 21.5 16.5" fill="none" stroke="url(#hla)" stroke-width="3.4" stroke-linecap="round"/>'
+    '<path d="M9.5 15.2 A6.5 6.5 0 0 1 22.5 15.2" fill="none" stroke="#67e8f9" stroke-width="2" stroke-linecap="round"/>'
+    '<rect x="4.2" y="13.8" width="6.2" height="3.6" rx="1.4" fill="url(#ex)"/>'
+    '<rect x="21.6" y="13.8" width="6.2" height="3.6" rx="1.4" fill="url(#ex)"/>'
+    '<polygon points="16,5.2 19.2,8.8 16,12.4 12.8,8.8" fill="url(#gem)"/>'
+    '<circle cx="19.8" cy="6.6" r="1" fill="#7dd3fc"/>'
+    '<circle cx="12.2" cy="11.2" r=".9" fill="#7dd3fc"/>'
     "</svg>"
 )
 

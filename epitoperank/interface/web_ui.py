@@ -200,8 +200,10 @@ code { font-family: var(--font-mono); font-size: .92em; padding: 1px 6px; border
 .sidebar :focus-visible { outline-color: #5eead4; }
 .brand { display: flex; align-items: center; gap: 12px; padding: 22px 20px 20px; border-bottom: 1px solid var(--sidebar-line); min-height: 78px; }
 .brand-mark { flex: none; width: 38px; height: 38px; border-radius: 11px; display: grid; place-items: center;
-  background: var(--brand-grad); box-shadow: 0 6px 18px -4px rgba(14,165,233,.55), inset 0 1px 0 rgba(255,255,255,.35); }
-.brand-mark svg { width: 24px; height: 24px; }
+  background: linear-gradient(145deg, #1b2b4e 0%, #070e20 100%);
+  border: 1px solid rgba(147,197,253,.28);
+  box-shadow: 0 6px 18px -4px rgba(14,165,233,.42), inset 0 1px 0 rgba(255,255,255,.22); }
+.brand-mark svg { width: 28px; height: 28px; }
 .brand-text { min-width: 0; }
 .brand-name { font-family: var(--font-display); font-size: 18px; font-weight: 700; letter-spacing: -.02em; color: var(--sidebar-strong); line-height: 1.2; white-space: nowrap; }
 .brand-tagline { margin-top: 3px; font-size: 11px; line-height: 1.4; color: var(--sidebar-text); opacity: .8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -803,7 +805,7 @@ body.motion-paused .start-guide::before { left: 72% !important; top: 40% !import
 <body>
 <div class="app">
   <button class="nav-scrim" tabindex="-1" aria-label="关闭导航" onclick="toggleNavigation(false)"></button><aside class="sidebar" id="app-navigation" aria-label="主导航"><div class="nav-fluid-marker" aria-hidden="true"></div><button class="drawer-close btn btn-secondary" type="button" onclick="toggleNavigation(false)">关闭菜单</button>
-    <div class="brand"><div class="brand-mark" aria-hidden="true"><svg viewBox="0 0 28 28" fill="none"><rect x="3" y="12" width="5.5" height="4" rx="1.5" fill="#fff"/><rect x="19.5" y="12" width="5.5" height="4" rx="1.5" fill="#fff"/><path d="M5.75 12 C9 4.5, 19 4.5, 22.25 12" stroke="#fff" stroke-width="2" stroke-linecap="round"/><path d="M5.75 16 C10 22.5, 18 22.5, 22.25 16" stroke="rgba(255,255,255,.55)" stroke-width="1.6" stroke-dasharray="2.5 2.5" stroke-linecap="round"/><circle cx="14" cy="6.6" r="2.2" fill="#fde047"/></svg></div><div class="brand-text"><div class="brand-name">EpitopeRank</div><div class="brand-tagline">rMATS 剪接新抗原 · ESM-2</div></div></div>
+    <div class="brand"><div class="brand-mark" aria-hidden="true"><svg viewBox="0 0 32 32" fill="none"><defs><linearGradient id="bm-ex" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#5eead4"/><stop offset="1" stop-color="#06b6d4"/></linearGradient><linearGradient id="bm-hla" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#a5b4fc"/><stop offset="1" stop-color="#4f46e5"/></linearGradient><linearGradient id="bm-gem" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fef08a"/><stop offset="1" stop-color="#f59e0b"/></linearGradient></defs><path d="M10.5 16.8 C10.5 23.6, 21.5 23.6, 21.5 16.8" stroke="url(#bm-hla)" stroke-width="3.3" stroke-linecap="round"/><path d="M9.5 15.2 A6.5 6.5 0 0 1 22.5 15.2" stroke="#67e8f9" stroke-width="2" stroke-linecap="round"/><rect x="3.8" y="13.8" width="6.5" height="3.8" rx="1.5" fill="url(#bm-ex)"/><rect x="21.7" y="13.8" width="6.5" height="3.8" rx="1.5" fill="url(#bm-ex)"/><polygon points="16,4.8 19.3,8.5 16,12.2 12.7,8.5" fill="url(#bm-gem)"/><circle cx="20.1" cy="6.2" r="1" fill="#7dd3fc"/><circle cx="11.9" cy="10.9" r=".9" fill="#7dd3fc"/></svg></div><div class="brand-text"><div class="brand-name">EpitopeRank</div><div class="brand-tagline">rMATS 剪接新抗原 · ESM-2</div></div></div>
     <div class="nav-section"><div class="nav-label">核心流程</div>
       <button type="button" class="nav-item active" data-page="dashboard" aria-current="page" title="项目工作台 (Alt+1)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z"/></svg>项目工作台</button>
       <button type="button" class="nav-item" data-page="pipeline" title="rMATS 分析 (Alt+2)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16 M4 12h16 M4 19h16 M8 3v4 M16 10v4 M10 17v4"/></svg>rMATS 分析</button>
