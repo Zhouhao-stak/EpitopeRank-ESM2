@@ -11,6 +11,7 @@ _OPTIONAL_DATAS = [
     (os.path.join(ROOT, "config"), "config"),
     (os.path.join(ROOT, ".env.example"), "."),
     (os.path.join(ROOT, "epitoperank", "interface", "opencc-cn2t.js"), "epitoperank/interface"),
+    (os.path.join(ROOT, "epitoperank", "interface", "logo.png"), "epitoperank/interface"),
     (os.path.join(ROOT, "epitoperank", "interface", "OPENCC-JS-LICENSE.txt"), "epitoperank/interface"),
     (os.path.join(ROOT, "epitoperank", "interface", "OPENCC-DATA-LICENSE.txt"), "epitoperank/interface"),
     (os.path.join(ROOT, "epitoperank", "interface", "OPENCC-NOTICE.txt"), "epitoperank/interface"),

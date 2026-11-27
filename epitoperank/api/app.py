@@ -255,6 +255,12 @@ def create_app() -> FastAPI:
         converter = Path(__file__).resolve().parent.parent / "interface" / "opencc-cn2t.js"
         return FileResponse(converter, media_type="application/javascript")
 
+    @app.get("/assets/logo.png", include_in_schema=False)
+    def brand_logo() -> FileResponse:
+        """Serve the bundled high-resolution EpitopeRank-ESM2 emblem."""
+        logo = Path(__file__).resolve().parent.parent / "interface" / "logo.png"
+        return FileResponse(logo, media_type="image/png")
+
     @app.get("/favicon.ico", include_in_schema=False)
     def favicon() -> Response:
         """返回内嵌的 SVG 站点图标，避免浏览器探测 /favicon.ico 时报 404。"""
