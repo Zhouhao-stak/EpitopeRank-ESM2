@@ -66,6 +66,9 @@ class TestUnifiedNeoantigenWorkbench:
         html = rendered_html()
         for needle in (
             'data-page="neoantigen"',
+            'data-lang="zh"',
+            'data-lang="zh-Hant"',
+            'data-lang="en"',
             'id="neo-tab-project"',
             'id="neo-tab-direct"',
             'id="neo-guided-run"',

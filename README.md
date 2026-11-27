@@ -1,10 +1,14 @@
 # EpitopeRank-ESM2
 
+**简体中文** · [繁體中文](README.zh-TW.md) · [English](README.en.md)
+
 **基于 ESM-2-650M LoRA 与 BigMHC-IM 双引擎异构融合的可变剪接新抗原免疫原性预测平台**
 
+[![Tests](https://github.com/Zhouhao-stak/EpitopeRank-ESM2/actions/workflows/test.yml/badge.svg)](https://github.com/Zhouhao-stak/EpitopeRank-ESM2/actions/workflows/test.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![Base Model: ESM-2-650M](https://img.shields.io/badge/ESM--2--650M-PEFT%20LoRA%205--Fold-green.svg)](https://huggingface.co/ZhouRitian/epitoperank-esm2-650m-lora-v4)
 [![Dual Engine: ESM-2 + BigMHC-IM](https://img.shields.io/badge/Dual--Engine-ESM2%20%2B%20BigMHC--IM-orange.svg)](#五10-篇真实顶刊-sota-同台对比与严格零泄露审计)
+[![UI: 简体 / 繁體 / EN](https://img.shields.io/badge/UI-简体%20%7C%20繁體%20%7C%20EN-blueviolet.svg)](#八快速开始与接入配置)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 
 > **项目演进说明**：本仓库是原项目 **[Zhouhao-stak/EpitopeRank](https://github.com/Zhouhao-stak/EpitopeRank)** 的大模型与多引擎免疫原性升级版（`SpliceGAIP_ESM2`）。

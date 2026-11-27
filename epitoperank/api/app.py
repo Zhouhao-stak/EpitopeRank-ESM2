@@ -251,6 +251,12 @@ def create_app() -> FastAPI:
         """Serve the browser UI (what the desktop exe opens automatically)."""
         return render_web_ui(f"EpitopeRank v{API_VERSION}")
 
+    @app.get("/assets/opencc-cn2t.js", include_in_schema=False)
+    def traditional_chinese_converter() -> FileResponse:
+        """Serve the bundled, offline Chinese script converter."""
+        converter = Path(__file__).resolve().parent.parent / "interface" / "opencc-cn2t.js"
+        return FileResponse(converter, media_type="application/javascript")
+
     @app.get("/favicon.ico", include_in_schema=False)
     def favicon() -> Response:
         """返回内嵌的 SVG 站点图标，避免浏览器探测 /favicon.ico 时报 404。"""

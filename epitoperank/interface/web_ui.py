@@ -834,7 +834,8 @@ body.motion-paused .start-guide::before { left: 72% !important; top: 40% !import
           <svg class="ico-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
         </button>
         <div class="lang-toggle" role="group" aria-label="Language" data-no-i18n>
-          <button type="button" data-lang="zh" class="active" aria-pressed="true">中文</button>
+          <button type="button" data-lang="zh" class="active" aria-pressed="true">简体</button>
+          <button type="button" data-lang="zh-Hant" aria-pressed="false">繁體</button>
           <button type="button" data-lang="en" aria-pressed="false">EN</button>
         </div>
         <button class="btn btn-secondary btn-sm" onclick="refreshData()">刷新</button>
