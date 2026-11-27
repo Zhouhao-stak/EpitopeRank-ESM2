@@ -65,6 +65,7 @@ _SWP_NOMOVE = 0x0002
 _SWP_NOZORDER = 0x0004
 _SWP_NOACTIVATE = 0x0010
 _SWP_FRAMECHANGED = 0x0020
+_SWP_ASYNCWINDOWPOS = 0x4000
 
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 _JobObjectExtendedLimitInformation = 9
@@ -209,7 +210,12 @@ def _apply_window_chrome(hwnd: int, theme: str = "light") -> bool:
             0,
             0,
             0,
-            _SWP_NOSIZE | _SWP_NOMOVE | _SWP_NOZORDER | _SWP_NOACTIVATE | _SWP_FRAMECHANGED,
+            _SWP_NOSIZE
+            | _SWP_NOMOVE
+            | _SWP_NOZORDER
+            | _SWP_NOACTIVATE
+            | _SWP_FRAMECHANGED
+            | _SWP_ASYNCWINDOWPOS,
         )
     except OSError:
         pass
@@ -238,10 +244,17 @@ class DesktopBridge:
 
     def set_theme(self, theme: str) -> bool:
         normalized = "dark" if str(theme).lower() == "dark" else "light"
-        if normalized == self.theme and _window_handle(self.window):
+        hwnd = _window_handle(self.window)
+        if normalized == self.theme and hwnd:
             return True
         self.theme = normalized
-        return _apply_window_chrome(_window_handle(self.window), normalized)
+        if hwnd:
+            threading.Thread(
+                target=_apply_window_chrome,
+                args=(hwnd, normalized),
+                daemon=True,
+            ).start()
+        return True
 
 
 def _unhook_pywebview_network_filter(window: object) -> None:
@@ -344,11 +357,7 @@ def main() -> int:
                     time.sleep(0.1)
             threading.Thread(target=_chrome_init, daemon=True).start()
 
-        def _on_loaded() -> None:
-            _unhook_pywebview_network_filter(window)
-
         window.events.shown += _on_shown
-        window.events.loaded += _on_loaded
 
         start_kwargs: dict[str, object] = {
             "gui": "edgechromium",

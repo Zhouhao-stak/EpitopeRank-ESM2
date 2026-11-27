@@ -5835,9 +5835,17 @@ document.addEventListener('DOMContentLoaded', () => { loadDashboard(); loadModel
     return converterLoad;
   }
 
-  // 转换器未就绪时原样返回，避免为了一个未完成的下载阻塞整页渲染。
+  // 转换器未就绪时原样返回，避免为了一个未完成的下载阻塞整页渲染；命中缓存直接返回。
+  var tradCache = Object.create(null);
   function toTraditional(text) {
-    if (traditionalConverter) return traditionalConverter(text);
+    if (!text) return text;
+    if (traditionalConverter) {
+      var cached = tradCache[text];
+      if (cached !== undefined) return cached;
+      var converted = traditionalConverter(text);
+      tradCache[text] = converted;
+      return converted;
+    }
     ensureTraditionalConverter();
     return text;
   }
@@ -6829,7 +6837,10 @@ document.addEventListener('DOMContentLoaded', () => { loadDashboard(); loadModel
       if (!Object.prototype.hasOwnProperty.call(store, name)) {
         store[name] = el.getAttribute(name);
       }
-      el.setAttribute(name, lang === "zh" ? store[name] : translateOne(store[name]));
+      var target = lang === "zh" ? store[name] : translateOne(store[name]);
+      if (el.getAttribute(name) !== target) {
+        el.setAttribute(name, target);
+      }
     }
   }
 
@@ -6904,8 +6915,19 @@ document.addEventListener('DOMContentLoaded', () => { loadDashboard(); loadModel
       buttons[i].classList.toggle("active", active);
       buttons[i].setAttribute("aria-pressed", active ? "true" : "false");
     }
-    walk(document.body);
-    translateTitle();
+    observer.disconnect();
+    try {
+      walk(document.body);
+      translateTitle();
+    } finally {
+      observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+        attributes: true,
+        attributeFilter: ATTRS
+      });
+    }
     try {
       document.dispatchEvent(new CustomEvent("epitoperank:language", { detail: { lang: lang } }));
     } catch (e) {}
