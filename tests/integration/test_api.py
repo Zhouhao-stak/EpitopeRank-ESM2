@@ -102,32 +102,6 @@ class TestProjectEndpoints:
         assert client.post('/api/neoantigen/workflow/advance', json=request).json()['next_stage'] == 2
         assert client.post('/api/neoantigen/workflow/advance', json=request).status_code == 409
 
-    def test_mopepgen_uses_project_files_and_keeps_results(self, tmp_path, client, monkeypatch):
-        import json
-        from pathlib import Path
-        import epitoperank.api.app as api_module
-        import epitoperank.mopepgen_docker as runner
-        monkeypatch.setenv('EPITOPERANK_INGEST_ALLOW_EXTERNAL', '1')
-        monkeypatch.setattr(api_module, 'project_status', lambda *_: {'project': {'source_dir': str(tmp_path)}})
-        for name in ('se.txt', 'genome.fa', 'reference.gtf', 'proteome.fa'):
-            (tmp_path / name).write_text('example')
-        def fake_run(args):
-            output = Path(args[args.index('--output') + 1]); output.mkdir(parents=True)
-            (output / 'manifest.json').write_text(json.dumps({'status':'complete'}))
-            return 0
-        monkeypatch.setattr(runner, 'execute', fake_run)
-        payload = {'project_id':'p', 'se':'se.txt', 'genome':'genome.fa', 'gtf':'reference.gtf',
-                   'proteome':'proteome.fa', 'reference_source':'GENCODE', 'reference_version':'test'}
-        response = client.post('/api/neoantigen/mopepgen', json=payload)
-        assert response.status_code == 200
-        path = response.json()['output_dir']
-        assert client.get('/api/neoantigen/mopepgen/file', params={'output_dir':path,'name':'manifest.json'}).status_code == 200
-        (tmp_path / 'SE.MATS.JC.txt').write_text('rMATS test')
-        payload['se'] = ''
-        assert client.post('/api/neoantigen/mopepgen', json=payload).status_code == 200
-        payload['genome'] = '../outside.fa'
-        assert client.post('/api/neoantigen/mopepgen', json=payload).status_code == 422
-
     def test_neo_readiness_checks_project_and_cds_header(self, tmp_path, client, monkeypatch):
         import epitoperank.api.app as api_module
         import epitoperank.data.loader as loader

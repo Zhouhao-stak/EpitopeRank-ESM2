@@ -1148,5 +1148,15 @@ def build_registry() -> dict[str, Action]:
             "Rebuild the CDS pair table (splice_orfs.tsv) from rMATS event coordinates when it is missing",
             rebuild_orf_table,
         ),
+        Action(
+            "call_mcp_tool",
+            "Call a tool on any connected MCP server, including external internet MCP servers",
+            call_mcp_tool_action,
+        ),
     ]
+    # First-class built-in MCP tools: one discoverable action per tool, with a
+    # declared argument schema so the planner can compose prediction chains.
+    from .mcp_actions import build_mcp_actions
+
+    actions.extend(build_mcp_actions())
     return {action.name: action for action in actions}
