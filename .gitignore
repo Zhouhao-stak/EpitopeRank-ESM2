@@ -1,0 +1,87 @@
+# EpitopeRank (refactored from BioGAIP)
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Test / tooling caches
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime state (SQLite databases, project outputs) — local disk only
+runtime/
+/var/tmp/epitoperank/
+deploy.tar.gz
+
+# Environments & secrets
+.env
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# --- legacy BioGAIP entries (kept for the archived code under legacy/) ---
+biolancher/script/windows_gui/out
+biolancher/script/windows_gui/python
+nf_pipeline_meta/*
+conda_pkg_meta/*
+bioGen/document/_book/*
+biolancher/script/windows_gui/node_modules/*
+biolancher/script/windows_gui/python/*
+biolancher/script/windows_gui/info/*
+/bioag_latest.tar.gz
+/bioworker_latest.tar.gz
+bioGen/docker/bioWorker/bioworker.sif
+bioGen/docker/bio_ag/onnx.tar.gz
+bioGen/document/node_modules/*
+biolancher/script/windows_gui_v2/python/*
+biolancher/script/windows_gui_v2/bioag/onnx.tar.gz
+bak/*
+
+# --- repository housekeeping ---
+# superseded files parked here instead of deleted (local only)
+_archive/
+# assistant / workspace tooling data
+.workbuddy/
+# rollback copies of packaged desktop builds
+*.prev
+# PyInstaller work dirs are disposable
+packaging/build-*/
+packaging/dist-*/
+packaging/build-log.txt
+
+# --- runtime output (never commit) ---
+# exported per-project deliverable folders
+/results/
+# scratch outputs, screenshots, ad-hoc probes
+/out/
+# runtime-learned agent state (threshold bandit / episodic memory)
+/.epitoperank/
+# local datasets: downloaded reference data, customer pilot inputs
+# (kept outside the repo root by convention, but be safe)
+/public_datasets/
+/data_public/
+/converted/
+
+# --- independent desktop builds (binaries + smoke outputs, never commit) ---
+/releases/
+/packaging/*.log
+/packaging/*-build-info.json
+/packaging/latest-independent-build.json
+/packaging/EpitopeRank-*-2026*.spec
+
+# --- local personal notes / interview prep (never commit) ---
+docs/EpitopeRank_模型训练与工程简历全细节总结.md
+docs/EpitopeRank_模型训练与工程简历全细节总结.html
+配置大模型.env.example
+*.env.local

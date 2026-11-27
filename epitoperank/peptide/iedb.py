@@ -1,0 +1,639 @@
+"""Client for the IEDB Analysis Resource REST API.
+
+The client is intentionally thin and auditable:
+
+* every request is hashed and (optionally) cached on disk,
+* every prediction record carries the exact method name/version and the
+  request hash, so a result table can be reproduced or inspected later,
+* the class-I, class-II, processing, stability and MHC-NP endpoints share one
+  transport with retries and a polite inter-request delay.
+
+Prediction is *not* the same as presentation or immunogenicity; see
+``docs/PEPTIDE.md`` for the interpretation rules the platform enforces.
+"""
+
+from __future__ import annotations
+
+import concurrent.futures
+import csv
+import hashlib
+import io
+import json
+import os
+import threading
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable, Iterable, Sequence
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+from .hla import HlaAllele, parse_panel
+from .sequences import MHC_I_LENGTHS, MHC_II_LENGTHS, normalize_peptide, unique
+
+TOOLS_URL = "https://tools-cluster-interface.iedb.org/tools_api/"
+QUERY_URL = "https://query-api.iedb.org/"
+USER_AGENT = "EpitopeRank/1.0 (peptide prediction; https://github.com/)"
+#: IEDB asks clients not to hammer the service; ~6 requests/second at most.
+DEFAULT_MIN_INTERVAL = 0.15
+#: Maximum sequences sent in one POST (IEDB gets slow with large FASTA input).
+MAX_SEQUENCES_PER_REQUEST = 100
+
+
+class IedbError(RuntimeError):
+    """Base class for prediction-service failures."""
+
+
+class IedbUnavailable(IedbError):
+    """The service could not be reached (network/DNS/timeout)."""
+
+
+class IedbResponseError(IedbError):
+    """The service answered, but not with a usable prediction table."""
+
+
+@dataclass(frozen=True)
+class Method:
+    """One selectable prediction model."""
+
+    key: str
+    api_method: str
+    label: str
+    tool: str
+    mhc_class: int
+    #: Column that carries the model score (kept verbatim in ``raw``).
+    score_field: str = "score"
+
+    def as_dict(self) -> dict[str, object]:
+        """导出可选预测模型的标识、IEDB 方法名与 MHC 类别。"""
+        return {
+            "key": self.key,
+            "api_method": self.api_method,
+            "label": self.label,
+            "tool": self.tool,
+            "mhc_class": self.mhc_class,
+        }
+
+
+METHODS: dict[str, Method] = {
+    "netmhcpan_el": Method("netmhcpan_el", "netmhcpan_el-4.1",
+                           "NetMHCpan-4.1 EL (IEDB recommended epitope)", "mhci", 1),
+    "netmhcpan_ba": Method("netmhcpan_ba", "netmhcpan_ba-4.1",
+                           "NetMHCpan-4.1 BA (binding affinity)", "mhci", 1),
+    "netmhcstabpan": Method("netmhcstabpan", "netmhcstabpan-1.0",
+                            "NetMHCstabpan-1.0 (peptide-MHC stability)", "mhci", 1),
+    "netmhciipan_el": Method("netmhciipan_el", "netmhciipan_el-4.1",
+                             "NetMHCIIpan-4.1 EL (IEDB recommended epitope)", "mhcii", 2),
+    "netmhciipan_ba": Method("netmhciipan_ba", "netmhciipan_ba-4.1",
+                             "NetMHCIIpan-4.1 BA (binding affinity)", "mhcii", 2),
+    "processing": Method("processing", "recommended",
+                         "IEDB MHC-I processing (proteasome + TAP + MHC)", "processing", 1),
+    "mhcnp": Method("mhcnp", "mhcnp", "MHC-NP (natural processing)", "mhcnp", 1),
+}
+
+DEFAULT_METHODS: dict[int, str] = {1: "netmhcpan_el", 2: "netmhciipan_el"}
+
+
+def _now() -> str:
+    """当前 UTC 时间（秒级 ISO 字符串），写入缓存与调用记录。"""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _default_cache_dir() -> Path:
+    """确定响应缓存目录：优先环境变量，其次运行目录，最后用户主目录（不联网）。"""
+    override = os.getenv("EPITOPERANK_PEPTIDE_CACHE")
+    if override:
+        return Path(override).expanduser()
+    try:
+        from epitoperank.storage import default_runtime_root
+
+        return default_runtime_root() / "peptide_cache"
+    except Exception:  # noqa: BLE001 - cache is optional
+        return Path.home() / ".cache" / "epitoperank-peptide"
+
+
+def _env_float(name: str, default: float) -> float:
+    """从环境变量读取浮点配置，缺失或非法时返回默认值。"""
+    try:
+        return float(os.getenv(name, "") or default)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    """从环境变量读取整数配置，缺失或非法时返回默认值。"""
+    try:
+        return int(os.getenv(name, "") or default)
+    except ValueError:
+        return default
+
+
+def _float(value: object) -> float | None:
+    """把 IEDB 返回的文本字段解析为浮点数；非法或 NaN/inf 返回 None。"""
+    try:
+        result = float(str(value))
+    except (TypeError, ValueError):
+        return None
+    if result != result or result in (float("inf"), float("-inf")):
+        return None
+    return result
+
+
+@dataclass
+class IedbClient:
+    """Synchronous IEDB client with retries and an optional disk cache."""
+
+    #: IEDB is occasionally slow from shared/cloud networks; both knobs are
+    #: environment-tunable so a deployment can raise the ceiling without a
+    #: code change.
+    timeout: float = field(default_factory=lambda: _env_float("EPITOPERANK_PEPTIDE_TIMEOUT", 45.0))
+    retries: int = field(default_factory=lambda: _env_int("EPITOPERANK_PEPTIDE_RETRIES", 2))
+    min_interval: float = DEFAULT_MIN_INTERVAL
+    cache_dir: Path | None = field(default_factory=_default_cache_dir)
+    cache_read: bool = True
+    cache_write: bool = True
+    opener: Callable[..., object] = urlopen
+    sleep: Callable[[float], None] = time.sleep
+    last_request_at: float = 0.0
+    progress_cb: Callable[[int, int, str], None] | None = None
+    #: Populated with one entry per network call (for manifests).
+    calls: list[dict[str, object]] = field(default_factory=list)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    # ------------------------------------------------------------------
+    # Transport
+    # ------------------------------------------------------------------
+    def _throttle(self) -> None:
+        """按最小请求间隔休眠，避免过于频繁地访问 IEDB 服务（并发模式下降低串行锁等待）。"""
+        interval = 0.06 if (self.opener is urlopen and self.min_interval > 0.06) else self.min_interval
+        if interval <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            wait = interval - (now - self.last_request_at)
+            self.last_request_at = max(now, self.last_request_at + interval)
+        if wait > 0:
+            self.sleep(wait)
+
+    def _cache_file(self, key: str) -> Path | None:
+        """返回缓存键对应的磁盘文件路径；未配置缓存目录时为 None。"""
+        if not self.cache_dir:
+            return None
+        return Path(self.cache_dir) / f"{key}.json"
+
+    def _cache_key(self, url: str, payload: dict[str, str]) -> str:
+        """对 URL 与请求参数求 SHA-256 摘要，作为缓存键与 request_id。"""
+        blob = json.dumps([url, sorted(payload.items())], ensure_ascii=False)
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:32]
+
+    def _read_cache(self, key: str) -> str | None:
+        """读取本地缓存的响应文本；不允许读缓存或文件损坏时返回 None。"""
+        path = self._cache_file(key)
+        if not path or not self.cache_read or not path.is_file():
+            return None
+        try:
+            return str(json.loads(path.read_text(encoding="utf-8"))["text"])
+        except (OSError, ValueError, KeyError):
+            return None
+
+    def _write_cache(self, key: str, url: str, payload: dict[str, str], text: str) -> None:
+        """把响应文本连同请求参数写入磁盘缓存；写失败被静默忽略，不影响预测。"""
+        path = self._cache_file(key)
+        if not path or not self.cache_write:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(
+                    {"url": url, "payload": payload, "text": text,
+                     "request_id": key, "fetched_at": _now()},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+        except OSError:  # cache failure must never break prediction
+            pass
+
+    def _post(self, url: str, payload: dict[str, str]) -> tuple[str, str]:
+        """向 IEDB 工具接口 POST 表单（需联网），命中缓存则直接返回。
+
+        4xx 立即抛 :class:`IedbResponseError`；5xx 与网络异常按指数退避重试，
+        重试耗尽后抛 :class:`IedbUnavailable` 供上层降级处理。
+        """
+        key = self._cache_key(url, payload)
+        cached = self._read_cache(key)
+        if cached is not None:
+            with self._lock:
+                self.calls.append({"url": url, "request_id": key, "cached": True})
+            return cached, key
+        body = urlencode(payload).encode("utf-8")
+        error: Exception | None = None
+        for attempt in range(self.retries + 1):
+            self._throttle()
+            request = Request(
+                url,
+                data=body,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": USER_AGENT,
+                },
+                method="POST",
+            )
+            try:
+                with self.opener(request, timeout=self.timeout) as response:
+                    raw = response.read(8_000_000)
+                text = raw.decode("utf-8-sig", errors="replace")
+                self._write_cache(key, url, payload, text)
+                with self._lock:
+                    self.calls.append({"url": url, "request_id": key, "cached": False,
+                                       "status": getattr(response, "status", 200)})
+                return text, key
+            except HTTPError as exc:
+                self.last_request_at = time.monotonic()
+                error = exc
+                if exc.code < 500:
+                    detail = ""
+                    try:
+                        detail = exc.read(500).decode("utf-8", errors="replace")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    raise IedbResponseError(
+                        f"IEDB returned HTTP {exc.code} for {url}: {detail.strip()[:300]}"
+                    ) from exc
+                self.sleep(min(2 ** attempt, 8))
+            except (URLError, TimeoutError, OSError) as exc:
+                self.last_request_at = time.monotonic()
+                error = exc
+                self.sleep(min(2 ** attempt, 8))
+        raise IedbUnavailable(f"IEDB request failed after {self.retries + 1} attempts: {error}")
+
+    def _get(self, url: str) -> object:
+        """GET 请求 IEDB query API 并解析 JSON（需联网），结果可缓存到磁盘。
+
+        无重试机制：HTTP 错误抛 :class:`IedbResponseError`，网络不可达抛
+        :class:`IedbUnavailable`。
+        """
+        key = self._cache_key(url, {})
+        path = self._cache_file(key)
+        if path and self.cache_read and path.is_file():
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))["json"]
+            except (OSError, ValueError, KeyError):
+                pass
+        request = Request(url, headers={"Accept": "application/json", "User-Agent": USER_AGENT})
+        try:
+            with self.opener(request, timeout=self.timeout) as response:
+                raw = response.read(4_000_000)
+        except HTTPError as exc:
+            raise IedbResponseError(f"IEDB query API returned HTTP {exc.code}: {url}") from exc
+        except (URLError, TimeoutError, OSError) as exc:
+            raise IedbUnavailable(f"IEDB query API unreachable: {exc}") from exc
+        payload = json.loads(raw.decode("utf-8", errors="replace"))
+        if path and self.cache_write:
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({"url": url, "json": payload}, ensure_ascii=False),
+                                encoding="utf-8")
+            except OSError:
+                pass
+        return payload
+
+    # ------------------------------------------------------------------
+    # Parsing helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _parse_table(text: str) -> list[dict[str, str]]:
+        """解析 IEDB 返回的制表符表格；错误信息或空响应抛
+        :class:`IedbResponseError`，仅表头的表视为合法的空结果。"""
+        stripped = text.lstrip("\ufeff \t\r\n")
+        if not stripped or stripped.lower().startswith(("error", "__all__", "input ")):
+            raise IedbResponseError(f"IEDB did not return a table: {stripped[:300]!r}")
+        reader = csv.DictReader(io.StringIO(stripped), delimiter="\t")
+        rows = [{(key or "").strip(): (value or "").strip() for key, value in row.items()}
+                for row in reader]
+        # A header-only table is a legitimate "no window of this length" answer.
+        return [row for row in rows if any(row.values())]
+
+    @staticmethod
+    def _lengths_present(peptides: Sequence[str], lengths: Sequence[int]) -> tuple[int, ...]:
+        """返回所请求长度中确实出现在肽段集合里的那部分（升序去重）。"""
+        requested = {int(item) for item in lengths}
+        present = sorted({len(item) for item in peptides} & requested)
+        return tuple(present)
+
+    @staticmethod
+    # 中文备注：肽预测：辅助处理fasta（参数：peptides）
+    def _fasta(peptides: Sequence[str]) -> tuple[str, dict[int, str]]:
+        """Return FASTA text plus the ``seq_num -> peptide`` map."""
+        mapping = {index + 1: peptide for index, peptide in enumerate(peptides)}
+        text = "\n".join(f">p{index}\n{peptide}" for index, peptide in mapping.items())
+        return text, mapping
+
+    def _batches(self, peptides: Sequence[str]) -> Iterable[Sequence[str]]:
+        """按单次请求上限把肽段列表切分成批次。"""
+        for start in range(0, len(peptides), MAX_SEQUENCES_PER_REQUEST):
+            yield peptides[start:start + MAX_SEQUENCES_PER_REQUEST]
+
+    # ------------------------------------------------------------------
+    # Class-I / class-II binding
+    # ------------------------------------------------------------------
+    # 中文备注：肽预测：预测mhci（参数：peptides、alleles、lengths、method）
+    def predict_mhci(self, peptides: Sequence[str], alleles: Sequence[str],
+                     *, lengths: Sequence[int] = MHC_I_LENGTHS,
+                     method: str = "netmhcpan_el") -> list[dict[str, object]]:
+        """Predict MHC-I binding for exact-length peptides.
+
+        IEDB pairs alleles with lengths one-to-one, so the allele is repeated
+        once per requested length in a single request per allele.
+        """
+        spec = METHODS.get(method)
+        if spec is None or spec.tool != "mhci":
+            raise ValueError(f"not an MHC-I method: {method!r}")
+        peptide_list = unique(normalize_peptide(item) for item in peptides)
+        if not peptide_list:
+            return []
+        allowed = self._lengths_present(peptide_list, lengths)
+        if not allowed:
+            return []
+        allele_list = [item.name for item in parse_panel(alleles)]
+        tasks = [(allele, list(batch)) for allele in allele_list for batch in self._batches(peptide_list)]
+
+        def _one(allele: str, batch: list[str]) -> list[dict[str, object]]:
+            text, _ = self._fasta(batch)
+            payload = {
+                "method": spec.api_method,
+                "sequence_text": text,
+                "allele": ",".join([allele] * len(allowed)),
+                "length": ",".join(str(item) for item in allowed),
+            }
+            response, request_id = self._post(TOOLS_URL + "mhci/", payload)
+            return self._binding_records(response, request_id, spec, allele, set(batch), allowed)
+
+        if self.opener is urlopen and len(tasks) > 1:
+            results: list[list[dict[str, object]]] = [[] for _ in tasks]
+            done = 0
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(tasks))) as pool:
+                fut_map = {pool.submit(_one, a, b): idx for idx, (a, b) in enumerate(tasks)}
+                for fut in concurrent.futures.as_completed(fut_map):
+                    idx = fut_map[fut]
+                    results[idx] = fut.result()
+                    done += 1
+                    if self.progress_cb is not None:
+                        self.progress_cb(done, len(tasks), f"MHC-I 结合预测 ({done}/{len(tasks)}) · {tasks[idx][0]}")
+            return [row for chunk in results for row in chunk]
+
+        records: list[dict[str, object]] = []
+        for idx, (allele, batch) in enumerate(tasks, 1):
+            records.extend(_one(allele, batch))
+            if self.progress_cb is not None:
+                self.progress_cb(idx, len(tasks), f"MHC-I 结合预测 ({idx}/{len(tasks)})")
+        return records
+
+    # 中文备注：肽预测：预测mhcii（参数：peptides、alleles、length、method）
+    def predict_mhcii(self, peptides: Sequence[str], alleles: Sequence[str],
+                      *, length: int | str = 15,
+                      method: str = "netmhciipan_el") -> list[dict[str, object]]:
+        """Predict MHC-II binding for 11-30 aa peptides (or ``asis``)."""
+        spec = METHODS.get(method)
+        if spec is None or spec.tool != "mhcii":
+            raise ValueError(f"not an MHC-II method: {method!r}")
+        peptide_list = unique(normalize_peptide(item) for item in peptides)
+        if not peptide_list:
+            return []
+        if length != "asis":
+            length = int(length)
+            if not 11 <= length <= 30:
+                raise ValueError("MHC-II peptide length must be 11-30 or 'asis'")
+        allele_list = [item.name for item in parse_panel(alleles)]
+        records: list[dict[str, object]] = []
+        for allele in allele_list:
+            for batch in self._batches(peptide_list):
+                text, _ = self._fasta(batch)
+                payload = {
+                    "method": spec.api_method,
+                    "sequence_text": text,
+                    "allele": allele,
+                    "length": str(length),
+                }
+                response, request_id = self._post(TOOLS_URL + "mhcii/", payload)
+                records.extend(self._binding_records(response, request_id, spec, allele,
+                                                    set(batch), None))
+        return records
+
+    def _binding_records(self, text: str, request_id: str, spec: Method, allele: str,
+                         peptides: set[str], lengths: Sequence[int] | None) -> list[dict[str, object]]:
+        """把绑定预测表格转成统一记录，过滤掉未请求的肽段与长度。"""
+        records: list[dict[str, object]] = []
+        for row in self._parse_table(text):
+            peptide = (row.get("peptide") or "").upper()
+            if peptide not in peptides:
+                continue
+            if lengths is not None and _float(row.get("length")) not in set(lengths):
+                continue
+            percentile = _float(row.get("percentile_rank", row.get("rank")))
+            records.append({
+                "peptide": peptide,
+                "allele": allele,
+                "mhc_class": spec.mhc_class,
+                "method": spec.key,
+                "method_label": spec.label,
+                "score": _float(row.get(spec.score_field)),
+                "percentile_rank": percentile,
+                "core": row.get("core_peptide", row.get("core", "")),
+                "request_id": request_id,
+                "source": "IEDB",
+                "raw": row,
+            })
+        return records
+
+    # ------------------------------------------------------------------
+    # Processing / MHC-NP / stability
+    # ------------------------------------------------------------------
+    # 中文备注：肽预测：预测processing（参数：peptides、alleles、lengths、proteasome）
+    def predict_processing(self, peptides: Sequence[str], alleles: Sequence[str],
+                           *, lengths: Sequence[int] = MHC_I_LENGTHS,
+                           proteasome: str = "immuno") -> list[dict[str, object]]:
+        """Predict proteasomal cleavage + TAP transport + MHC-I processing.
+
+        The IEDB processing service returns HTTP 500 when a FASTA batch is
+        combined with several lengths, so one request is sent per
+        (allele, length) pair.  This is slower but reliable.
+        """
+        if proteasome not in ("immuno", "constitutive"):
+            raise ValueError("proteasome must be 'immuno' or 'constitutive'")
+        spec = METHODS["processing"]
+        peptide_list = unique(normalize_peptide(item) for item in peptides)
+        if not peptide_list:
+            return []
+        allowed = self._lengths_present(peptide_list, lengths)
+        if not allowed:
+            return []
+        allele_list = [item.name for item in parse_panel(alleles)]
+        tasks = [
+            (allele, length, list(batch))
+            for allele in allele_list
+            for length in allowed
+            for batch in self._batches(peptide_list)
+        ]
+
+        def _one_proc(allele: str, length: int, batch: list[str]) -> list[dict[str, object]]:
+            text, _ = self._fasta(batch)
+            payload = {
+                "method": spec.api_method,
+                "sequence_text": text,
+                "allele": allele,
+                "length": str(length),
+                "proteasome": proteasome,
+            }
+            response, request_id = self._post(TOOLS_URL + "processing/", payload)
+            batch_set = set(batch)
+            out: list[dict[str, object]] = []
+            for row in self._parse_table(response):
+                peptide = (row.get("peptide") or "").upper()
+                if peptide not in batch_set:
+                    continue
+                if _float(row.get("length")) != length:
+                    continue
+                out.append({
+                    "peptide": peptide,
+                    "allele": allele,
+                    "mhc_class": 1,
+                    "method": "processing",
+                    "method_label": spec.label,
+                    "proteasome_score": _float(row.get("proteasome_score")),
+                    "tap_score": _float(row.get("tap_score")),
+                    "total_score": _float(row.get("total_score")),
+                    "processing_score": _float(row.get("processing_score")),
+                    "ic50_score": _float(row.get("ic50_score")),
+                    "request_id": request_id,
+                    "source": "IEDB",
+                    "raw": row,
+                })
+            return out
+
+        if self.opener is urlopen and len(tasks) > 1:
+            results: list[list[dict[str, object]]] = [[] for _ in tasks]
+            done = 0
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, len(tasks))) as pool:
+                fut_map = {pool.submit(_one_proc, a, ln, b): idx for idx, (a, ln, b) in enumerate(tasks)}
+                for fut in concurrent.futures.as_completed(fut_map):
+                    idx = fut_map[fut]
+                    results[idx] = fut.result()
+                    done += 1
+                    if self.progress_cb is not None:
+                        a, ln, _ = tasks[idx]
+                        self.progress_cb(done, len(tasks), f"抗原加工预测 ({done}/{len(tasks)}) · {a} ({ln}aa)")
+            return [row for chunk in results for row in chunk]
+
+        records: list[dict[str, object]] = []
+        for idx, (allele, length, batch) in enumerate(tasks, 1):
+            records.extend(_one_proc(allele, length, batch))
+            if self.progress_cb is not None:
+                self.progress_cb(idx, len(tasks), f"抗原加工预测 ({idx}/{len(tasks)})")
+        return records
+
+    # 中文备注：肽预测：预测mhcnp（参数：peptides、alleles、lengths）
+    def predict_mhcnp(self, peptides: Sequence[str], alleles: Sequence[str],
+                      *, lengths: Sequence[int] = MHC_I_LENGTHS) -> list[dict[str, object]]:
+        """MHC-NP: probability that a peptide is naturally processed and presented."""
+        spec = METHODS["mhcnp"]
+        peptide_list = unique(normalize_peptide(item) for item in peptides)
+        if not peptide_list:
+            return []
+        allowed = self._lengths_present(peptide_list, lengths)
+        if not allowed:
+            return []
+        allele_list = [item.name for item in parse_panel(alleles)]
+        records: list[dict[str, object]] = []
+        for allele in allele_list:
+            for batch in self._batches(peptide_list):
+                text, _ = self._fasta(batch)
+                payload = {
+                    "method": spec.api_method,
+                    "sequence_text": text,
+                    "allele": ",".join([allele] * len(allowed)),
+                    "length": ",".join(str(item) for item in allowed),
+                }
+                response, request_id = self._post(TOOLS_URL + "mhcnp/", payload)
+                for row in self._parse_table(response):
+                    peptide = (row.get("peptide") or "").upper()
+                    if peptide not in set(batch):
+                        continue
+                    records.append({
+                        "peptide": peptide,
+                        "allele": allele,
+                        "mhc_class": 1,
+                        "method": "mhcnp",
+                        "method_label": spec.label,
+                        "mhcnp_probability": _float(row.get("prob_score")),
+                        "request_id": request_id,
+                        "source": "IEDB",
+                        "raw": row,
+                    })
+        return records
+
+    # 中文备注：肽预测：预测stability（参数：peptides、alleles）
+    def predict_stability(self, peptides: Sequence[str], alleles: Sequence[str]) -> list[dict[str, object]]:
+        """Predict peptide-MHC stability with NetMHCstabpan-1.0."""
+        return self.predict_mhci(peptides, alleles, method="netmhcstabpan")
+
+    # ------------------------------------------------------------------
+    # Known-epitope lookup
+    # ------------------------------------------------------------------
+    # 中文备注：肽预测：辅助处理lookupepitopes（参数：peptides、limit）
+    def lookup_epitopes(self, peptides: Sequence[str], *, limit: int = 3) -> dict[str, list[dict[str, object]]]:
+        """Look up assay records for each peptide in the IEDB (query API).
+
+        A hit means the exact peptide sequence has been assayed before; it
+        does **not** mean this candidate is a validated neoantigen.
+        """
+        result: dict[str, list[dict[str, object]]] = {}
+        for peptide in unique(normalize_peptide(item) for item in peptides):
+            url = (f"{QUERY_URL}tcell_search?linear_sequence=eq.{peptide}"
+                   f"&limit={int(limit)}")
+            try:
+                payload = self._get(url)
+            except IedbError:
+                result[peptide] = []
+                continue
+            rows = payload if isinstance(payload, list) else []
+            result[peptide] = [
+                {
+                    "peptide": peptide,
+                    "mhc_class": row.get("mhc_class"),
+                    "mhc_restriction": row.get("mhc_restriction"),
+                    "qualitative_measure": row.get("qualitative_measure"),
+                    "assay": (row.get("assay_description") or "").replace("<br/>", " ")[:200],
+                    "source_organism": row.get("source_organism_name"),
+                    "antigen": row.get("parent_source_antigen_name") or row.get("structure_description"),
+                    "pubmed_id": row.get("pubmed_id"),
+                }
+                for row in rows[:limit]
+            ]
+        return result
+
+    # ------------------------------------------------------------------
+    # Allele catalogue
+    # ------------------------------------------------------------------
+    # 中文备注：肽预测：辅助处理HLA 型别catalogue（参数：method）
+    def allele_catalogue(self, method: str = "netmhcpan_el") -> list[str]:
+        """Return the alleles the IEDB lists for a method (network required)."""
+        spec = METHODS.get(method)
+        if spec is None:
+            raise ValueError(f"unknown method {method!r}")
+        text, _ = self._post(TOOLS_URL + f"{spec.tool}/", {"method": spec.api_method, "species": "human"})
+        return [line.strip() for line in text.splitlines() if line.strip().startswith("HLA-")]
+
+
+# 中文备注：肽预测：辅助处理method表（参数：无）
+def method_table() -> list[dict[str, object]]:
+    """Describe every model this client can call (for API/docs/UI)."""
+    return [spec.as_dict() for spec in METHODS.values()]
+
+
+# 中文备注：肽预测：描述describe（参数：allele）
+def describe(allele: str) -> HlaAllele:
+    """Describe one allele (thin wrapper around :func:`hla.parse_panel`)."""
+    return parse_panel([allele])[0]

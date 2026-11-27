@@ -1,0 +1,877 @@
+# -*- coding: utf-8 -*-
+"""从 rMATS 事件坐标重建 CDS 对照表（ORF 重建）。
+
+背景
+----
+``epitoperank/peptide/pipeline.py`` 明确「从不重建 ORF」，肽预测依赖外部提供的
+``event_id / reference_cds / altered_cds / junction_nt`` 四列表。本模块把这一步
+收进平台内部：读原始 rMATS 表 → 参考转录本结构 → 组装参考/异常 CDS → 落表。
+
+参考源
+------
+* ``ensembl``（默认，联网）：Ensembl REST 取转录本、CDS 区段与基因组序列，
+  结果落磁盘缓存；无需下载 GB 级基因组。基因组版本由 REST 返回的
+  ``assembly_name`` 记录到 manifest。
+* ``local``（离线，可复现）：本地 GTF + FASTA（自动建立 .fai 索引）。
+
+支持的事件
+----------
+* **SE**：参考 CDS = 含盒式外显子的转录本 CDS；异常 CDS = 删去该外显子；
+  ``junction_nt`` = 连接点前的 CDS 核苷酸数。
+* **RI**：参考 CDS = 正常 CDS；异常 CDS = 在外显子边界插入保留内含子序列。
+* A3SS / A5SS / MXE 因需要更复杂的转录本选择，本版本明确记为
+  ``unsupported_event_type`` 并跳过，不做猜测。
+
+科学边界：坐标必须与参考基因组版本一致；只保证所提供转录本的读码框，
+不证明该转录本就是样本里实际表达的异构体。产出仍属探索性候选。
+"""
+from __future__ import annotations
+
+import concurrent.futures
+import csv
+import gzip
+import hashlib
+import json
+import re
+import threading
+import time
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Iterable
+
+from epitoperank.splicing.parsers.rmats import discover_rmats_tables
+
+COMPLEMENT = str.maketrans("ACGTNacgtn", "TGCANtgcan")
+STOP_CODONS = ("TAA", "TAG", "TGA")
+CODON_TABLE = dict(zip(
+    (a + b + c for a in "TCAG" for b in "TCAG" for c in "TCAG"),
+    "FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+))
+ENSEMBL = "https://rest.ensembl.org"
+CDS_FIELDS = ("event_id", "reference_cds", "altered_cds", "junction_nt")
+
+#: 能重建 CDS 对照表的 rMATS 事件类型（对应五类剪接事件全集）。
+SUPPORTED_EVENT_TYPES = ("SE", "RI", "A3SS", "A5SS", "MXE")
+
+
+def _revcomp(seq: str) -> str:
+    """返回 DNA 序列的反向互补（未知碱基保留为 N）。"""
+    return seq.translate(COMPLEMENT)[::-1]
+
+
+def _clean_seq(seq: str) -> str:
+    """把序列统一成大写 A/C/G/T/N，去掉空白与数字。"""
+    return re.sub(r"[^ACGTNacgtn]", "", seq).upper()
+
+
+def _cache_path(cache_dir: Path, url: str) -> Path:
+    """按 URL 生成稳定的缓存文件名。"""
+    return cache_dir / (hashlib.sha256(url.encode()).hexdigest()[:24] + ".txt")
+
+
+def _http(url: str, *, timeout: float = 40.0, cache_dir: Path | None = None,
+          retries: int = 3) -> str:
+    """直连（绕过本机代理）取文本，带磁盘缓存与重试。"""
+    cached = _cache_path(cache_dir, url) if cache_dir else None
+    if cached and cached.is_file():
+        return cached.read_text(encoding="utf-8")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener.addheaders = [("Content-Type", "application/json"),
+                         ("User-Agent", "EpitopeRank-ORFBuilder/1.0")]
+    last: Exception | None = None
+    for attempt in range(retries):
+        try:
+            with opener.open(url, timeout=timeout) as resp:
+                text = resp.read().decode("utf-8", "replace")
+            if cached:
+                cached.parent.mkdir(parents=True, exist_ok=True)
+                cached.write_text(text, encoding="utf-8")
+            time.sleep(0.15)
+            return text
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            time.sleep(1.0 + attempt)
+    raise RuntimeError(f"参考数据请求失败: {url} ({last})")
+
+
+# ---------------------------------------------------------------------------
+# 参考源
+# ---------------------------------------------------------------------------
+class ReferenceProvider:
+    """转录本结构与基因组序列的最小接口。"""
+
+    def transcripts(self, chrom: str, start: int, end: int, strand: int,
+                    gene_id: str) -> list[dict[str, Any]]:
+        """返回覆盖事件的蛋白编码转录本列表（含 id/start/end/strand/gene_id）。"""
+        raise NotImplementedError
+
+    def cds_segments(self, transcript: dict[str, Any]) -> list[dict[str, Any]]:
+        """返回一个转录本的全部 CDS 区段：start/end/phase/strand，1-based 闭区间。"""
+        raise NotImplementedError
+
+    def sequence(self, chrom: str, start: int, end: int) -> str:
+        """返回参考基因组正链的 1-based 闭区间序列。"""
+        raise NotImplementedError
+
+    def assembly(self) -> str:
+        """返回基因组版本声明，写进 manifest。"""
+        raise NotImplementedError
+
+
+class EnsemblReference(ReferenceProvider):
+    """Ensembl REST 在线参考源（GRCh38 / human）。结果缓存到磁盘。"""
+
+    # 中文备注：剪接解析：初始化__init__（参数：species、cache_dir、timeout）
+    def __init__(self, species: str = "human", cache_dir: Path | None = None,
+                 timeout: float = 20.0) -> None:
+        self.species = species
+        self.timeout = timeout
+        self.cache_dir = cache_dir
+        self._assembly = ""
+        self._overlap_cache: dict[str, list[dict[str, Any]]] = {}
+        self._cds_by_parent: dict[str, list[dict[str, Any]]] = {}
+        self._lock = threading.Lock()
+
+    # 中文备注：剪接解析：获取_get（参数：url）
+    def _get(self, url: str) -> str:
+        return _http(url, timeout=self.timeout, cache_dir=self.cache_dir)
+
+    # 中文备注：剪接解析：辅助处理查询（参数：region、features）
+    def _query(self, region: str, features: Iterable[str]) -> list[dict[str, Any]]:
+        query = ";".join(f"feature={f}" for f in features)
+        url = (f"{ENSEMBL}/overlap/region/{self.species}/{region}"
+               f"?{query};content-type=application/json")
+        raw = self._get(url)
+        data = json.loads(raw)
+        if not isinstance(data, list):
+            return []
+        if not self._assembly and data:
+            self._assembly = str(data[0].get("assembly_name") or "")
+        return [x for x in data if isinstance(x, dict)]
+
+    @staticmethod
+    # 中文备注：剪接解析：转换为片段（参数：row）
+    def _as_segment(row: dict[str, Any]) -> dict[str, Any] | None:
+        if row.get("feature_type") != "cds":
+            return None
+        try:
+            phase = int(row.get("phase") or 0)
+        except (TypeError, ValueError):
+            phase = 0
+        return {"start": int(row["start"]), "end": int(row["end"]),
+                "phase": phase, "strand": int(row.get("strand") or 1),
+                "parent": str(row.get("Parent") or "")}
+
+    # 中文备注：剪接解析：辅助处理transcripts（参数：chrom、start、end、strand）
+    def transcripts(self, chrom: str, start: int, end: int, strand: int,
+                    gene_id: str) -> list[dict[str, Any]]:
+        region = f"{chrom}:{max(1, start - 1500)}-{end + 1500}"
+        # 一次请求同时拿转录本与 CDS：REST 返回的是「与区间重叠的转录本」的
+        # 全部 CDS 区段，因此可顺带缓存，避免每个转录本再发一次请求。
+        rows = self._query(region, ("transcript", "cds"))
+        cds = [seg for row in rows if (seg := self._as_segment(row))]
+        with self._lock:
+            for seg in cds:
+                bucket = self._cds_by_parent.setdefault(seg["parent"], [])
+                if seg not in bucket:
+                    bucket.append(seg)
+            cds_snapshot = {k: list(v) for k, v in self._cds_by_parent.items()}
+        out = []
+        for row in rows:
+            if row.get("feature_type") != "transcript":
+                continue
+            if row.get("biotype") != "protein_coding":
+                continue
+            if int(row.get("strand") or 0) != strand:
+                continue
+            parent = str(row.get("Parent") or "")
+            if gene_id and parent and parent.split(".")[0] != gene_id.split(".")[0]:
+                continue
+            tid = str(row.get("id") or "")
+            # 该转录本是否存在与事件外显子重叠的 CDS（= 外显子是否编码）
+            hits = cds_snapshot.get(tid, [])
+            coding = any(min(s["end"], end) - max(s["start"], start) + 1 >= 12
+                         for s in hits)
+            out.append({
+                "id": tid, "start": int(row["start"]), "end": int(row["end"]),
+                "strand": int(row["strand"]), "gene_id": parent,
+                "chrom": chrom, "coding": coding,
+            })
+        # 优先选「该外显子确实落在 CDS 内」且跨度较短的转录本
+        out.sort(key=lambda t: (not t["coding"], t["end"] - t["start"]))
+        return out[:12]
+
+    # 中文备注：剪接解析：辅助处理CDS片段（参数：transcript）
+    def cds_segments(self, transcript: dict[str, Any]) -> list[dict[str, Any]]:
+        tid = transcript["id"]
+        with self._lock:
+            cached = self._overlap_cache.get(tid)
+            from_parent = list(self._cds_by_parent.get(tid, [])) if cached is None and tid in self._cds_by_parent else None
+        if cached is None:
+            if from_parent is not None:
+                parsed = [s for s in from_parent if s["parent"] == tid]
+            else:
+                url = (f"{ENSEMBL}/overlap/id/{urllib.parse.quote(tid)}"
+                       f"?feature=cds;content-type=application/json")
+                rows = [x for x in json.loads(self._get(url)) if isinstance(x, dict)]
+                parsed = [seg for row in rows if (seg := self._as_segment(row))]
+                parsed = [s for s in parsed if s["parent"] == tid]
+            with self._lock:
+                self._overlap_cache[tid] = parsed
+            cached = parsed
+        segs = [{k: v for k, v in s.items() if k != "parent"} for s in cached]
+        segs.sort(key=lambda s: s["start"], reverse=transcript["strand"] < 0)
+        return segs
+
+    # 中文备注：剪接解析：辅助处理序列（参数：chrom、start、end）
+    def sequence(self, chrom: str, start: int, end: int) -> str:
+        if end - start > 300_000:
+            raise ValueError("单次请求的基因组区间过大（>300kb）")
+        url = (f"{ENSEMBL}/sequence/region/{self.species}/"
+               f"{chrom}:{start}-{end}:1?content-type=text/plain")
+        return _clean_seq(self._get(url))
+
+    # 中文备注：剪接解析：辅助处理assembly（参数：无）
+    def assembly(self) -> str:
+        return self._assembly or "Ensembl REST (GRCh38)"
+
+
+class LocalReference(ReferenceProvider):
+    """本地 GTF + FASTA 参考源；FASTA 需带 .fai（无则自动建立）。"""
+
+    # 中文备注：剪接解析：初始化__init__（参数：gtf、fasta）
+    def __init__(self, gtf: Path, fasta: Path) -> None:
+        self.gtf = Path(gtf)
+        self.fasta = Path(fasta)
+        if not self.gtf.is_file() or not self.fasta.is_file():
+            raise FileNotFoundError("本地参考需要同时提供 GTF 与 FASTA 文件")
+        self._cds: dict[str, list[dict[str, Any]]] = {}
+        self._meta: dict[str, dict[str, Any]] = {}
+        self._fai: dict[str, tuple[int, int, int, int]] = {}
+        self._load_gtf()
+        self._load_fai()
+
+    @staticmethod
+    # 中文备注：剪接解析：辅助处理attr（参数：text、key）
+    def _attr(text: str, key: str) -> str:
+        match = re.search(rf'{key}\s+"([^"]+)"', text)
+        return match.group(1) if match else ""
+
+    # 中文备注：剪接解析：辅助处理opener（参数：path）
+    def _opener(self, path: Path):
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace") \
+            if path.suffix == ".gz" else path.open("r", encoding="utf-8", errors="replace")
+
+    # 中文备注：剪接解析：加载gtf（参数：无）
+    def _load_gtf(self) -> None:
+        with self._opener(self.gtf) as fh:
+            for line in fh:
+                if not line or line.startswith("#"):
+                    continue
+                cols = line.rstrip("\n").split("\t")
+                if len(cols) < 9 or cols[2] != "CDS":
+                    continue
+                tid = self._attr(cols[8], "transcript_id")
+                if not tid:
+                    continue
+                try:
+                    start, end = int(cols[3]), int(cols[4])
+                    strand = 1 if cols[6] == "+" else -1
+                    phase = 0 if cols[7] == "." else int(cols[7])
+                except (ValueError, IndexError):
+                    continue
+                self._cds.setdefault(tid, []).append(
+                    {"start": start, "end": end, "phase": phase, "strand": strand})
+                self._meta[tid] = {
+                    "id": tid, "start": start, "end": end, "strand": strand,
+                    "gene_id": self._attr(cols[8], "gene_id"), "chrom": cols[0],
+                }
+        for tid, segs in self._cds.items():
+            segs.sort(key=lambda s: s["start"], reverse=self._meta[tid]["strand"] < 0)
+            meta = self._meta[tid]
+            meta["start"] = min(s["start"] for s in segs)
+            meta["end"] = max(s["end"] for s in segs)
+            meta["chrom"] = self._meta[tid].get("chrom", "")
+
+    # 中文备注：剪接解析：加载fai（参数：无）
+    def _load_fai(self) -> None:
+        index = Path(str(self.fasta) + ".fai")
+        if not index.is_file():
+            self._build_fai(index)
+        with index.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) >= 5:
+                    self._fai[parts[0]] = (int(parts[1]), int(parts[2]),
+                                           int(parts[3]), int(parts[4]))
+
+    def _build_fai(self, index: Path) -> None:
+        """流式扫描 FASTA 生成 .fai（name, length, offset, linebases, linewidth）。"""
+        records = []
+        with self.fasta.open("rb") as fh:
+            name, offset, length, line_bases, line_width = "", 0, 0, 0, 0
+            pos = 0
+            for raw in fh:
+                if raw.startswith(b">"):
+                    if name:
+                        records.append((name, length, offset, line_bases, line_width))
+                    name = raw[1:].split()[0].decode("ascii", "replace")
+                    offset = pos + len(raw)
+                    length = 0
+                    line_bases = line_width = 0
+                else:
+                    chunk = raw.strip()
+                    if not line_bases:
+                        line_bases = len(chunk)
+                        line_width = len(raw)
+                    length += len(chunk)
+                pos += len(raw)
+            if name:
+                records.append((name, length, offset, line_bases, line_width))
+        index.write_text("".join(
+            f"{n}\t{l}\t{o}\t{b}\t{w}\n" for n, l, o, b, w in records),
+            encoding="utf-8")
+
+    # 中文备注：剪接解析：辅助处理transcripts（参数：chrom、start、end、strand）
+    def transcripts(self, chrom: str, start: int, end: int, strand: int,
+                    gene_id: str) -> list[dict[str, Any]]:
+        out = []
+        for tid, meta in self._meta.items():
+            if meta["strand"] != strand or meta["chrom"].lstrip("chr") != chrom.lstrip("chr"):
+                continue
+            if meta["end"] < start or meta["start"] > end:
+                continue
+            if gene_id and meta["gene_id"] and gene_id not in (meta["gene_id"], ""):
+                # 允许版本后缀差异（ENSG00000140105 vs ENSG00000140105.13）
+                if meta["gene_id"].split(".")[0] != gene_id.split(".")[0]:
+                    continue
+            segs = self._cds.get(tid, [])
+            coding = any(min(s["end"], end) - max(s["start"], start) + 1 >= 12
+                         for s in segs)
+            out.append({**meta, "coding": coding})
+        out.sort(key=lambda t: (not t["coding"], t["end"] - t["start"]))
+        return out[:12]
+
+    # 中文备注：剪接解析：辅助处理CDS片段（参数：transcript）
+    def cds_segments(self, transcript: dict[str, Any]) -> list[dict[str, Any]]:
+        return list(self._cds.get(transcript["id"], []))
+
+    # 中文备注：剪接解析：辅助处理序列（参数：chrom、start、end）
+    def sequence(self, chrom: str, start: int, end: int) -> str:
+        key = next((k for k in self._fai if k.lstrip("chr") == chrom.lstrip("chr")), None)
+        if key is None:
+            raise ValueError(f"FASTA 中找不到染色体 {chrom}")
+        _, offset, line_bases, line_width = self._fai[key]
+        first = offset + (start - 1) // line_bases * line_width + (start - 1) % line_bases
+        last = offset + (end - 1) // line_bases * line_width + (end - 1) % line_bases
+        with self.fasta.open("rb") as fh:
+            fh.seek(first)
+            raw = fh.read(max(0, last - first + 1))
+        return _clean_seq(raw.decode("ascii", "replace"))
+
+    # 中文备注：剪接解析：辅助处理assembly（参数：无）
+    def assembly(self) -> str:
+        return f"local: {self.gtf.name} + {self.fasta.name}"
+
+
+# ---------------------------------------------------------------------------
+# CDS 组装
+# ---------------------------------------------------------------------------
+@dataclass
+class AssembledCDS:
+    """一个转录本组装出来的 CDS 及其分段边界。"""
+
+    sequence: str
+    segments: list[dict[str, Any]] = field(default_factory=list)
+
+    def segment_offset(self, index: int) -> int:
+        """第 index 个 CDS 区段起点在拼接 CDS 中的 0-based 偏移。"""
+        return sum(s["length"] for s in self.segments[:index])
+
+
+def assemble_cds(provider: ReferenceProvider, transcript: dict[str, Any]) -> AssembledCDS:
+    """按转录本方向拼接所有 CDS 区段，处理相位与反向互补。"""
+    segs = provider.cds_segments(transcript)
+    if not segs:
+        return AssembledCDS("", [])
+    chrom = transcript["chrom"]
+    span_start = min(s["start"] for s in segs)
+    span_end = max(s["end"] for s in segs)
+    genome = provider.sequence(chrom, span_start, span_end)
+    strand = transcript["strand"]
+    pieces, meta = [], []
+    for seg in segs:
+        left = seg["start"] - span_start
+        right = seg["end"] - span_start + 1
+        piece = genome[left:right]
+        if len(piece) != seg["end"] - seg["start"] + 1:
+            raise ValueError("参考序列长度与 CDS 区段不符")
+        if strand < 0:
+            piece = _revcomp(piece)
+        pieces.append(piece)
+        meta.append({**seg, "length": len(piece),
+                     "genomic_start": seg["start"], "genomic_end": seg["end"]})
+    # GTF phase：首个 CDS 区段 5' 端需去掉 phase 个碱基才能落在完整密码子上
+    first_phase = int(meta[0].get("phase") or 0) % 3
+    if first_phase:
+        pieces[0] = pieces[0][first_phase:]
+        meta[0] = {**meta[0], "length": len(pieces[0])}
+    seq = "".join(pieces)
+    # 从第一个 ATG 开始，保证是蛋白编码起点；同步修正各区段在拼接 CDS 中的长度
+    atg = seq.find("ATG")
+    if atg > 0:
+        seq = seq[atg:]
+        left = atg
+        for item in meta:
+            cut = min(left, item["length"])
+            item["length"] -= cut
+            left -= cut
+            if left <= 0:
+                break
+    return AssembledCDS(seq, meta)
+
+
+def _protein(seq: str) -> str:
+    """翻译到首个终止密码子（与 neoantigen.translate 语义一致）。"""
+    if len(seq) % 3 or set(seq) - set("ACGT"):
+        return ""
+    aa = "".join(CODON_TABLE[seq[i:i + 3]] for i in range(0, len(seq), 3))
+    return aa.split("*", 1)[0]
+
+
+def _peptide_possible(ref: str, alt: str, junction: int) -> bool:
+    """连接点两侧能否产生至少一条 8–11mer 且不存在于参考 ORF 的肽。"""
+    if not (1 <= junction < len(alt)):
+        return False
+    reference, altered = _protein(ref), _protein(alt)
+    left_aa = (junction - 1) // 3
+    right_aa = junction // 3
+    if right_aa >= len(altered):
+        return False
+    for length in (8, 9, 10, 11):
+        lo = max(0, right_aa - length + 1)
+        hi = min(left_aa, len(altered) - length)
+        for start in range(lo, hi + 1):
+            peptide = altered[start:start + length]
+            if len(peptide) == length and peptide not in reference:
+                return True
+    return False
+
+
+def _trim_codons(seq: str) -> str:
+    """去掉末尾不完整密码子，保证 translate() 不会因长度报错。"""
+    return seq[:len(seq) // 3 * 3]
+
+
+def _match_segment(segments: list[dict[str, Any]], start: int, end: int,
+                   min_overlap: int = 12) -> int:
+    """找出与给定基因组区间重叠最多的 CDS 区段下标，找不到返回 -1。"""
+    best, best_hit = -1, 0
+    for i, seg in enumerate(segments):
+        hit = min(seg["genomic_end"], end) - max(seg["genomic_start"], start) + 1
+        if hit > best_hit:
+            best, best_hit = i, hit
+    return best if best_hit >= min_overlap else -1
+
+
+def _read_rows(path: Path) -> list[dict[str, str]]:
+    """读 rMATS 表（支持 .gz），列名统一小写。"""
+    opener = gzip.open(path, "rt", encoding="utf-8-sig", errors="replace") \
+        if path.suffix == ".gz" else path.open("r", encoding="utf-8-sig", errors="replace")
+    with opener as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        rows = []
+        for row in reader:
+            rows.append({str(k).strip().lower(): str(v or "").strip()
+                         for k, v in row.items() if k is not None})
+        return rows
+
+
+# 中文备注：剪接解析：辅助处理num（参数：row）
+def _num(row: dict[str, str], *keys: str) -> float:
+    for key in keys:
+        try:
+            return float(row.get(key, ""))
+        except (TypeError, ValueError):
+            continue
+    return float("nan")
+
+
+def _select_events(input_dir: Path, *, event_ids: list[str] | None,
+                   fdr_max: float, min_abs_dpsi: float, max_events: int) -> list[dict[str, Any]]:
+    """从原始 rMATS 表筛选显著事件，返回带完整坐标信息的记录。"""
+    tables = discover_rmats_tables(input_dir, max_depth=2)
+    wanted = set(event_ids or [])
+    found: list[dict[str, Any]] = []
+    for event_type, table in tables.items():
+        for row in _read_rows(table.path):
+            raw_id = row.get("id", "")
+            eid = f"{event_type}:{raw_id}"
+            if wanted and eid not in wanted:
+                continue
+            fdr, dpsi = _num(row, "fdr"), _num(row, "incleveldifference")
+            if fdr == fdr and fdr > fdr_max:
+                continue
+            if dpsi == dpsi and abs(dpsi) < min_abs_dpsi:
+                continue
+            if dpsi != dpsi or fdr != fdr:
+                continue
+            found.append({
+                "event_id": eid, "event_type": event_type,
+                "gene_id": row.get("geneid", ""), "gene_symbol": row.get("genesymbol", ""),
+                "chrom": row.get("chr", ""), "strand": row.get("strand", ""),
+                "fdr": fdr, "delta_psi": dpsi, "row": row,
+                "support": _num(row, "ijc_sample_1", "ijc_sample_2") or 0.0,
+            })
+    found.sort(key=lambda e: (abs(e["delta_psi"]), e["support"]), reverse=True)
+    return found[:max_events]
+
+
+def _build_one(event: dict[str, Any], provider: ReferenceProvider) -> dict[str, Any]:
+    """为单个事件重建 CDS 对，返回结果字典（含 reason 时表示跳过）。"""
+    etype = event["event_type"]
+    if etype not in SUPPORTED_EVENT_TYPES:
+        return {"reason": "unsupported_event_type"}
+    row, strand = event["row"], (1 if event["strand"] == "+" else -1)
+    chrom = event["chrom"].replace("chr", "")
+    try:
+        span = _event_span(etype, row)
+    except (KeyError, ValueError):
+        return {"reason": "missing_coordinates"}
+    exon_start, exon_end = span
+    transcripts = provider.transcripts(chrom, exon_start, exon_end, strand, event["gene_id"])
+    if not transcripts:
+        return {"reason": "no_coding_transcript"}
+    if etype == "SE" and not any(t.get("coding") for t in transcripts):
+        # 盒式外显子落在 UTR：坐标能重建转录本结构，但不改变蛋白序列
+        return {"reason": "exon_not_coding"}
+    # 控制单个事件的外部请求量：只试前若干个最相关的转录本，
+    # 并跳过跨度过大的转录本（一次序列请求最多 300kb）。
+    candidates = [t for t in transcripts if t["end"] - t["start"] <= 200_000][:4]
+    for transcript in candidates:
+        try:
+            assembled = assemble_cds(provider, transcript)
+        except (ValueError, KeyError, RuntimeError):
+            continue
+        if not assembled.sequence.startswith("ATG"):
+            continue
+        ref = assembled.sequence
+        if etype == "SE":
+            alt, junctions, frame = _se_alternative(assembled, exon_start, exon_end)
+        elif etype == "RI":
+            alt, junctions, frame, reason = _ri_alternative(
+                assembled, provider, chrom, strand, row)
+            if reason:
+                return {"reason": reason}
+            if alt is None:
+                continue
+        elif etype in {"A3SS", "A5SS"}:
+            alt, junctions, frame, reason = _shifted_exon_alternative(
+                assembled, provider, chrom, strand, row)
+            if reason == "exon_forms_not_overlapping":
+                return {"reason": reason}
+            if alt is None:
+                continue
+        else:  # MXE
+            alt, junctions, frame, reason = _mutually_exclusive_alternative(
+                assembled, provider, chrom, strand, row)
+            if reason in {"missing_coordinates", "exon_forms_not_overlapping"}:
+                return {"reason": reason}
+            if alt is None:
+                continue
+        if alt is None:
+            continue
+        # translate() 要求整码子；截掉末尾不完整密码子不改变上游读码框
+        ref, alt = _trim_codons(ref), _trim_codons(alt)
+        junction = next((j for j in junctions if _peptide_possible(ref, alt, j)), None)
+        if junction is None:
+            continue
+        return {
+            "event_id": event["event_id"], "reference_cds": ref,
+            "altered_cds": alt, "junction_nt": junction,
+            "transcript_id": transcript["id"], "frame_status": frame,
+            "gene_symbol": event["gene_symbol"], "delta_psi": event["delta_psi"],
+            "fdr": event["fdr"],
+        }
+    return {"reason": "no_reconstructable_orf"}
+
+
+def _int_field(row: dict[str, str], key: str) -> int:
+    """读取 rMATS 的坐标列，缺失或非数值时抛 KeyError。"""
+    value = row.get(key)
+    if value in (None, ""):
+        raise KeyError(key)
+    return int(float(value))
+
+
+def _event_span(etype: str, row: dict[str, str]) -> tuple[int, int]:
+    """返回事件涉及的外显子基因组跨度（1-based 闭区间），用于定位候选转录本。"""
+    if etype == "SE":
+        return _int_field(row, "exonstart_0base") + 1, _int_field(row, "exonend")
+    if etype == "RI":
+        return _int_field(row, "riexonstart_0base") + 1, _int_field(row, "riexonend")
+    if etype in {"A3SS", "A5SS"}:
+        # rMATS 的短型外显子列名是 shortES / shortEE（不是 shortExonStart_0base）
+        low = _int_field(row, "longexonstart_0base") + 1
+        high = _int_field(row, "longexonend")
+        low2 = _int_field(row, "shortes") + 1
+        high2 = _int_field(row, "shortee")
+        return min(low, low2), max(high, high2)
+    low = _int_field(row, "1stexonstart_0base") + 1
+    high = _int_field(row, "1stexonend")
+    low2 = _int_field(row, "2ndexonstart_0base") + 1
+    high2 = _int_field(row, "2ndexonend")
+    return min(low, low2), max(high, high2)
+
+
+def _tx_span(start: int, end: int, strand: int) -> tuple[int, int]:
+    """把基因组区间映射到转录本方向的升序坐标（负链取负后翻转）。"""
+    return (start, end) if strand > 0 else (-end, -start)
+
+
+def _genomic_span(tx_start: int, tx_end: int, strand: int) -> tuple[int, int]:
+    """把转录本方向的升序区间还原为基因组正链的升序区间。"""
+    return (tx_start, tx_end) if strand > 0 else (-tx_end, -tx_start)
+
+
+def _se_alternative(assembled: AssembledCDS, exon_start: int,
+                    exon_end: int) -> tuple[str | None, list[int], str]:
+    """SE：删掉盒式外显子对应的整段 CDS。"""
+    idx = _match_segment(assembled.segments, exon_start, exon_end)
+    if idx < 0:
+        return None, [], ""
+    seg = assembled.segments[idx]
+    offset = assembled.segment_offset(idx)
+    alt = assembled.sequence[:offset] + assembled.sequence[offset + seg["length"]:]
+    frame = "frameshift" if seg["length"] % 3 else "in_frame"
+    return alt, [offset], frame
+
+
+def _ri_alternative(assembled: AssembledCDS, provider: ReferenceProvider,
+                    chrom: str, strand: int, row: dict[str, str]
+                    ) -> tuple[str | None, list[int], str, str]:
+    """RI：把保留的内含子插在两个相邻 CDS 区段之间。"""
+    try:
+        intron_start = _int_field(row, "upstreamee") + 1
+        intron_end = _int_field(row, "downstreames") - 1
+    except (KeyError, ValueError):
+        return None, [], "", "missing_coordinates"
+    if intron_end <= intron_start or intron_end - intron_start > 20_000:
+        return None, [], "", "invalid_intron_length"
+    segs = assembled.segments
+    idx = next((i for i, s in enumerate(segs)
+                if s["genomic_end"] < intron_start
+                and i + 1 < len(segs)
+                and segs[i + 1]["genomic_start"] > intron_end), -1)
+    if idx < 0:
+        return None, [], "", ""
+    offset = assembled.segment_offset(idx) + segs[idx]["length"]
+    intron = provider.sequence(chrom, intron_start, intron_end)
+    if strand < 0:
+        intron = _revcomp(intron)
+    alt = assembled.sequence[:offset] + intron + assembled.sequence[offset:]
+    frame = "frameshift" if len(intron) % 3 else "in_frame"
+    return alt, [offset], frame, ""
+
+
+def _shifted_exon_alternative(assembled: AssembledCDS, provider: ReferenceProvider,
+                              chrom: str, strand: int, row: dict[str, str]
+                              ) -> tuple[str | None, list[int], str, str]:
+    """A3SS / A5SS：同一外显子的一个边界在两个位点之间移动。
+
+    两个形式共享一个边界，对称差就是「只有长型才有」的那段基因组区间。
+    转录本若含长型 → 异常 CDS = 删掉该段；若含短型 → 异常 CDS = 插入该段。
+    移动位点是否真的落在编码区，用外显子边界与 CDS 区段边界是否重合判定，
+    避免把落在 UTR 的位点移动误当成蛋白序列改变。
+
+    坐标口径：longExonStart_0base 为 0-based 起点、longExonEnd 为闭区间终点；
+    rMATS 的短型列 shortES / shortEE 沿用同一口径（shortES 亦为 0-based 起点）。
+    """
+    try:
+        long_form = (_int_field(row, "longexonstart_0base") + 1,
+                     _int_field(row, "longexonend"))
+        short_form = (_int_field(row, "shortes") + 1,
+                      _int_field(row, "shortee"))
+    except (KeyError, ValueError):
+        return None, [], "", "missing_coordinates"
+    l1, l2 = _tx_span(long_form[0], long_form[1], strand)
+    s1, s2 = _tx_span(short_form[0], short_form[1], strand)
+    if l1 == s1 and l2 == s2:
+        return None, [], "", "exon_forms_identical"
+    if l1 != s1 and l2 != s2:
+        # A3SS/A5SS 的两个形式必须共享一个边界，两端都不同说明坐标口径不一致
+        # （例如 shortES 的 0/1-based 取法不同），此时不做猜测直接跳过。
+        return None, [], "", "exon_forms_inconsistent"
+    if l1 != s1:
+        diff, side = ((min(l1, s1), max(l1, s1) - 1)), "low"
+    else:
+        diff, side = ((min(l2, s2) + 1, max(l2, s2))), "high"
+    d_start, d_end = diff
+    d_len = d_end - d_start + 1
+    if d_len <= 0:
+        return None, [], "", "exon_forms_identical"
+    common_start, common_end = max(l1, s1), min(l2, s2)
+    common_g = _genomic_span(common_start, common_end, strand)
+    idx = _match_segment(assembled.segments, common_g[0], common_g[1], min_overlap=1)
+    if idx < 0:
+        return None, [], "", "exon_not_in_cds"
+    seg = assembled.segments[idx]
+    g1, g2 = _tx_span(seg["genomic_start"], seg["genomic_end"], strand)
+    base = assembled.segment_offset(idx)
+    long_boundary = l1 if side == "low" else l2
+    short_boundary = s1 if side == "low" else s2
+    seg_boundary = g1 if side == "low" else g2
+    if seg_boundary == long_boundary and g1 <= d_start and d_end <= g2:
+        # 转录本含长型：删掉差异段
+        offset = base + (d_start - g1)
+        alt = assembled.sequence[:offset] + assembled.sequence[offset + d_len:]
+        return alt, [offset], "exon_shortened", ""
+    if seg_boundary == short_boundary:
+        # 转录本含短型：把差异段插在相邻的区段边界上
+        offset = base if side == "low" else base + seg["length"]
+        g_start, g_end = _genomic_span(d_start, d_end, strand)
+        extra = provider.sequence(chrom, g_start, g_end)
+        if strand < 0:
+            extra = _revcomp(extra)
+        alt = assembled.sequence[:offset] + extra + assembled.sequence[offset:]
+        return alt, [offset], "exon_lengthened", ""
+    return None, [], "", "alternative_site_outside_cds"
+
+
+def _mutually_exclusive_alternative(assembled: AssembledCDS, provider: ReferenceProvider,
+                                    chrom: str, strand: int, row: dict[str, str]
+                                    ) -> tuple[str | None, list[int], str, str]:
+    """MXE：两个互斥外显子互换。
+
+    参考转录本含其中一个外显子时，异常 CDS 把它替换成另一个的序列。
+    只有被替换的外显子完整落在 CDS 内（CDS 区段边界与之一致）才重建；
+    部分编码的情况直接跳过，避免凭空补出 UTR 序列。
+    """
+    try:
+        first = (_int_field(row, "1stexonstart_0base") + 1, _int_field(row, "1stexonend"))
+        second = (_int_field(row, "2ndexonstart_0base") + 1, _int_field(row, "2ndexonend"))
+    except (KeyError, ValueError):
+        return None, [], "", "missing_coordinates"
+    for picked, other in ((first, second), (second, first)):
+        low, high = min(picked), max(picked)
+        idx = _match_segment(assembled.segments, low, high)
+        if idx < 0:
+            continue
+        seg = assembled.segments[idx]
+        if seg["genomic_start"] != low or seg["genomic_end"] != high:
+            continue  # 该外显子只有一部分是 CDS：不重建
+        o_low, o_high = min(other), max(other)
+        if o_high - o_low + 1 > 20_000:
+            return None, [], "", "alternative_exon_too_long"
+        replacement = provider.sequence(chrom, o_low, o_high)
+        if strand < 0:
+            replacement = _revcomp(replacement)
+        offset = assembled.segment_offset(idx)
+        alt = (assembled.sequence[:offset] + replacement
+               + assembled.sequence[offset + seg["length"]:])
+        frame = "in_frame" if len(replacement) % 3 == seg["length"] % 3 else "frameshift"
+        # 互斥外显子有左右两个连接点，任一能产出新肽即可
+        return alt, [offset, offset + len(replacement)], frame, ""
+    return None, [], "", "no_exclusive_exon_in_cds"
+
+
+
+def build_orf_table(input_dir: Path, output: Path, *, provider: ReferenceProvider,
+                    event_ids: list[str] | None = None, fdr_max: float = 0.05,
+                    min_abs_dpsi: float = 0.1, max_events: int = 25,
+                    time_budget: float = 180.0,
+                    progress_cb: Callable[[int, int, str], None] | None = None) -> dict[str, Any]:
+    """从 rMATS 表重建 CDS 对照表，并返回可审计的构建摘要。"""
+    input_dir, output = Path(input_dir), Path(output)
+    events = _select_events(input_dir, event_ids=event_ids, fdr_max=fdr_max,
+                            min_abs_dpsi=min_abs_dpsi, max_events=max_events)
+    rows, skipped = [], []
+    started = time.monotonic()
+    total = len(events)
+    if progress_cb is not None:
+        progress_cb(0, total, "准备重建跨连接点 ORF…")
+
+    if isinstance(provider, EnsemblReference) and total > 1:
+        outcomes: list[dict[str, Any] | None] = [None] * total
+        done_count = 0
+
+        def _worker(idx: int, ev: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+            if time.monotonic() - started > time_budget:
+                return idx, {"reason": "time_budget_exceeded"}
+            try:
+                return idx, _build_one(ev, provider)
+            except Exception as exc:  # noqa: BLE001
+                return idx, {"reason": f"error: {exc}"}
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(6, total)) as pool:
+            futures = [pool.submit(_worker, i, ev) for i, ev in enumerate(events)]
+            for fut in concurrent.futures.as_completed(futures):
+                idx, res = fut.result()
+                outcomes[idx] = res
+                done_count += 1
+                if progress_cb is not None:
+                    ev = events[idx]
+                    label = ev.get("gene_symbol") or ev.get("event_id") or ""
+                    progress_cb(done_count, total, f"ORF 重建 ({done_count}/{total}) · {label}")
+
+        for idx, event in enumerate(events):
+            result = outcomes[idx] or {"reason": "skipped"}
+            if "reason" in result:
+                skipped.append({"event_id": event["event_id"], "reason": result["reason"]})
+            else:
+                rows.append(result)
+    else:
+        for index, event in enumerate(events):
+            if time.monotonic() - started > time_budget:
+                skipped.extend({"event_id": e["event_id"], "reason": "time_budget_exceeded"}
+                               for e in events[index:])
+                break
+            try:
+                result = _build_one(event, provider)
+            except Exception as exc:  # noqa: BLE001 - 单事件失败不影响整批
+                skipped.append({"event_id": event["event_id"], "reason": f"error: {exc}"})
+                if progress_cb is not None:
+                    progress_cb(index + 1, total, event["event_id"])
+                continue
+            if progress_cb is not None:
+                progress_cb(index + 1, total, event.get("gene_symbol") or event["event_id"])
+            if "reason" in result:
+                skipped.append({"event_id": event["event_id"], "reason": result["reason"]})
+                continue
+            rows.append(result)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh, delimiter="\t", lineterminator="\n")
+        writer.writerow(CDS_FIELDS)
+        for row in rows:
+            writer.writerow([row[k] for k in CDS_FIELDS])
+    manifest = {
+        "input_dir": str(input_dir), "output": str(output),
+        "reference": provider.assembly(),
+        "genome_build": provider.assembly(),
+        "event_count": len(events), "written": len(rows), "skipped": skipped,
+        "filters": {"fdr_max": fdr_max, "min_abs_dpsi": min_abs_dpsi,
+                    "max_events": max_events, "time_budget": time_budget,
+                    "event_ids": event_ids or []},
+        "supported_event_types": list(SUPPORTED_EVENT_TYPES),
+        "limitations": [
+            "只重建所选参考转录本的读码框，不证明该转录本在样本中实际表达。",
+            "事件坐标必须与参考基因组版本一致；版本不匹配时结果无效。",
+            "A3SS/A5SS 用长型与短型的对称差重建，位点移动若落在 UTR 则判为不改变蛋白；"
+            "MXE 只在两个互斥外显子都完整落在 CDS 内时互换，部分编码的直接跳过。",
+            "输出为探索性候选 CDS，仍需表达证据、正常组织过滤与实验验证。",
+        ],
+        "provenance": [
+            {"event_id": r["event_id"], "gene_symbol": r.get("gene_symbol", ""),
+             "transcript_id": r.get("transcript_id", ""),
+             "frame_status": r.get("frame_status", ""),
+             "junction_nt": r["junction_nt"],
+             "reference_cds_length": len(r["reference_cds"]),
+             "altered_cds_length": len(r["altered_cds"])} for r in rows
+        ],
+    }
+    Path(str(output) + ".manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return manifest
