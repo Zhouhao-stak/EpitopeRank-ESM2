@@ -41,18 +41,19 @@ jobs:
 
       - name: Verify build output
         run: |
-          if (!(Test-Path dist\EpitopeRank-Desktop.exe)) {
-            Write-Error "EpitopeRank-Desktop.exe not found in dist/"
+          if (!(Test-Path dist\EpitopeRank-Desktop-ESM2.exe)) {
+            Write-Error "EpitopeRank-Desktop-ESM2.exe not found in dist/"
             exit 1
           }
 
       - name: Package portable ZIP
         run: |
-          $zip = "EpitopeRank-${{ github.ref_name }}-windows.zip"
+          $zip = "EpitopeRank-ESM2-${{ github.ref_name }}-windows-x64.zip"
           New-Item -ItemType Directory -Force -Path release | Out-Null
-          Copy-Item dist\EpitopeRank-Desktop.exe release\
+          Copy-Item dist\EpitopeRank-Desktop-ESM2.exe release\
           Copy-Item .env.example release\ -ErrorAction SilentlyContinue
-          Copy-Item "配置大模型.env.example" release\ -ErrorAction SilentlyContinue
+          Copy-Item README.md release\ -ErrorAction SilentlyContinue
+          Copy-Item LICENSE release\ -ErrorAction SilentlyContinue
           Compress-Archive -Path "release\*" -DestinationPath $zip -Force
           Write-Host "Created $zip"
 
@@ -60,7 +61,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: epitoperank-windows
-          path: EpitopeRank-${{ github.ref_name }}-windows.zip
+          path: EpitopeRank-ESM2-${{ github.ref_name }}-windows-x64.zip
           retention-days: 5
 
   release:
