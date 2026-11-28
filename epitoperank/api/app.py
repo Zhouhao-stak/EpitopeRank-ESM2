@@ -38,35 +38,31 @@ logger = logging.getLogger(__name__)
 #: Remembered CDS column mappings, stored next to the table it describes.
 CDS_MAPPING_FILE = ".cds_mapping.json"
 
-# Midnight-navy squircle with cyan splice exons + arc, violet HLA-I binding groove,
-# and golden-amber TCR immunogenicity diamond hotspot, matching packaging/icon.ico.
+# Obsidian midnight squircle with luminous cyan-to-indigo diagonal DNA double helix,
+# matching packaging/icon.ico and epitoperank/interface/logo.png.
 # Served as a real endpoint because browsers probe /favicon.ico unconditionally
 # and a 404 there shows up as a console error.
 _FAVICON_SVG = (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
     "<defs>"
     '<linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">'
-    '<stop offset="0" stop-color="#1b2b4e"/><stop offset="1" stop-color="#070e20"/>'
+    '<stop offset="0" stop-color="#0f172a"/><stop offset="1" stop-color="#050811"/>'
     "</linearGradient>"
-    '<linearGradient id="ex" x1="0" y1="0" x2="0" y2="1">'
-    '<stop offset="0" stop-color="#5eead4"/><stop offset="1" stop-color="#06b6d4"/>'
+    '<linearGradient id="s1" x1="0" y1="1" x2="1" y2="0">'
+    '<stop offset="0" stop-color="#22d3ee"/><stop offset="1" stop-color="#818cf8"/>'
     "</linearGradient>"
-    '<linearGradient id="hla" x1="0" y1="0" x2="0" y2="1">'
-    '<stop offset="0" stop-color="#a5b4fc"/><stop offset="1" stop-color="#4f46e5"/>'
-    "</linearGradient>"
-    '<linearGradient id="gem" x1="0" y1="0" x2="1" y2="1">'
-    '<stop offset="0" stop-color="#fef08a"/><stop offset="1" stop-color="#f59e0b"/>'
+    '<linearGradient id="s2" x1="0" y1="1" x2="1" y2="0">'
+    '<stop offset="0" stop-color="#818cf8"/><stop offset="1" stop-color="#38bdf8"/>'
     "</linearGradient>"
     "</defs>"
     '<rect width="32" height="32" rx="7.5" fill="url(#bg)"/>'
-    '<rect x="1.2" y="1.2" width="29.6" height="29.6" rx="6.5" fill="none" stroke="#93c5fd" stroke-opacity=".3" stroke-width="1"/>'
-    '<path d="M10.5 16.5 C10.5 23.2, 21.5 23.2, 21.5 16.5" fill="none" stroke="url(#hla)" stroke-width="3.4" stroke-linecap="round"/>'
-    '<path d="M9.5 15.2 A6.5 6.5 0 0 1 22.5 15.2" fill="none" stroke="#67e8f9" stroke-width="2" stroke-linecap="round"/>'
-    '<rect x="4.2" y="13.8" width="6.2" height="3.6" rx="1.4" fill="url(#ex)"/>'
-    '<rect x="21.6" y="13.8" width="6.2" height="3.6" rx="1.4" fill="url(#ex)"/>'
-    '<polygon points="16,5.2 19.2,8.8 16,12.4 12.8,8.8" fill="url(#gem)"/>'
-    '<circle cx="19.8" cy="6.6" r="1" fill="#7dd3fc"/>'
-    '<circle cx="12.2" cy="11.2" r=".9" fill="#7dd3fc"/>'
+    '<g transform="rotate(-45 16 16)">'
+    '<line x1="12.5" y1="11.5" x2="19.5" y2="11.5" stroke="#67e8f9" stroke-width="1.3" stroke-linecap="round"/>'
+    '<line x1="12" y1="16" x2="20" y2="16" stroke="#e0f2fe" stroke-width="1.8" stroke-linecap="round"/>'
+    '<line x1="12.5" y1="20.5" x2="19.5" y2="20.5" stroke="#a5b4fc" stroke-width="1.3" stroke-linecap="round"/>'
+    '<path d="M11 6 C11 11, 21 11, 21 16 C21 21, 11 21, 11 26" fill="none" stroke="url(#s1)" stroke-width="2.4" stroke-linecap="round"/>'
+    '<path d="M21 6 C21 11, 11 11, 11 16 C11 21, 21 21, 21 26" fill="none" stroke="url(#s2)" stroke-width="2.4" stroke-linecap="round"/>'
+    "</g>"
     "</svg>"
 )
 
