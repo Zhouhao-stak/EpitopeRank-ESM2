@@ -1,7 +1,8 @@
-# EpitopeRank Docker Image
-# Based on Alpine for minimal size and reliable package management
+# EpitopeRank-ESM2 Docker Image
+# Based on Debian slim (glibc) so numpy/scipy/matplotlib/pillow use official
+# prebuilt manylinux wheels on both linux/amd64 and linux/arm64.
 
-FROM python:3.11-alpine AS builder
+FROM python:3.11-slim AS builder
 
 WORKDIR /build
 
@@ -9,9 +10,12 @@ WORKDIR /build
 # CI/海外环境用 --build-arg PIP_INDEX_URL=https://pypi.org/simple 覆盖。
 ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 
-# Install build dependencies (Alpine uses apk, much faster than apt)
-# Added rust compiler for gseapy which requires it for building from source
-RUN apk add --no-cache gcc g++ musl-dev rust cargo
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    pkg-config \
+    libfreetype6-dev \
+    libpng-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy and install Python dependencies
 COPY requirements.txt .
@@ -19,7 +23,7 @@ RUN pip install --upgrade pip && \
     pip install --no-cache-dir --index-url "$PIP_INDEX_URL" --prefix=/install -r requirements.txt
 
 # ---- Runtime Stage ----
-FROM python:3.11-alpine AS runtime
+FROM python:3.11-slim AS runtime
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -28,11 +32,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     EPITOPERANK_MEMORY_DB=/data/epitoperank.sqlite3 \
     EPITOPERANK_LITERATURE_DB=/data/literature.sqlite3
 
-# Install runtime dependencies (libgomp for OpenMP support)
-RUN apk add --no-cache libgomp
+# Install minimal runtime libraries (OpenMP + font/image libs for matplotlib)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 \
+    libfreetype6 \
+    libpng16-16 \
+    && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
-RUN addgroup -S epitoperank && adduser -S epitoperank -G epitoperank
+RUN groupadd -r epitoperank && useradd -r -g epitoperank -m epitoperank
 
 WORKDIR /app
 
